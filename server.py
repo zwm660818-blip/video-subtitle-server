@@ -1,19 +1,24 @@
 """Video-to-subtitle backend.
 
-POST /transcribe: takes a Douyin/Kuaishou video link and returns a Chinese
-transcript (Groq Whisper). Pipeline: zacao parse -> download -> ffmpeg audio
-extract -> Groq transcribe (chunked if the mp3 is over 25 MB).
+POST /transcribe starts a background job and returns a job_id immediately
+(long videos take 2-4 minutes, past the platform proxy's ~2 minute limit
+for one request). Poll GET /jobs/{id} until status is done or error.
+
+Pipeline: zacao parse -> download -> ffmpeg audio extract -> Groq
+transcribe (chunked if the mp3 is over 25 MB) -> LLM proofread of
+homophone errors.
 
 The Groq API key comes ONLY from the GROQ_API_KEY environment variable.
 No secret is stored in this code.
 """
 
-import asyncio
 import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -352,19 +357,35 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
     return fixed, {"changed": changed, "batches": batches}
 
 
-def do_transcribe(url: str, mode: str, api_key: str) -> dict:
-    """Run the whole pipeline in a worker thread. Returns the response dict."""
+def do_transcribe(url: str, mode: str, api_key: str, on_stage=None) -> dict:
+    """Run the whole pipeline in a worker thread. Returns the response dict.
+
+    on_stage, when given, is called with the current stage name so a caller
+    running this in the background can report real progress: parse, download,
+    audio, transcribe, proofread.
+    """
+    def stage(name: str):
+        if on_stage is not None:
+            try:
+                on_stage(name)
+            except Exception:
+                pass
+
     model = MODELS.get(mode, MODELS["fast"])
     with tempfile.TemporaryDirectory(prefix="vts-") as tmp:
         tmpdir = Path(tmp)
+        stage("parse")
         video_url, title = parse_link(url)
+        stage("download")
         video_path = tmpdir / "video.mp4"
         download_video(video_url, video_path)
+        stage("audio")
         duration = probe_duration(video_path)
         mp3_path = tmpdir / "audio.mp3"
         extract_audio(video_path, mp3_path)
         chunks = split_audio(mp3_path, duration, tmpdir)
 
+        stage("transcribe")
         segments: list[dict] = []
         for chunk_path, offset in chunks:
             result = transcribe_file(chunk_path, model, api_key)
@@ -376,6 +397,7 @@ def do_transcribe(url: str, mode: str, api_key: str) -> dict:
                 })
         # Proofread: fix homophone errors from context. Never breaks the
         # transcription itself -- on failure the raw segments are returned.
+        stage("proofread")
         proofread_stats = {"changed": 0, "batches": 0}
         try:
             segments, proofread_stats = proofread_segments(segments, title, api_key)
@@ -388,6 +410,56 @@ def do_transcribe(url: str, mode: str, api_key: str) -> dict:
             "segments": segments,
             "proofread": proofread_stats,
         }
+
+
+# ---------------------------------------------------------------- jobs
+# Long videos take 2-4 minutes end to end (download + transcribe +
+# proofread), but the platform proxy kills synchronous requests after
+# ~2 minutes (HTTP 524, seen twice on a 20-minute video). So /transcribe
+# only starts a background job and returns immediately; the page polls
+# /jobs/{id} until the job is done. Jobs live in memory only -- a
+# container that sleeps mid-job loses it, and the page must retry.
+
+jobs: dict[str, dict] = {}
+jobs_lock = threading.Lock()
+JOB_TTL_SECONDS = 3600
+
+
+def _run_job(job_id: str, url: str, mode: str, api_key: str) -> None:
+    """Background worker: run the pipeline and store the outcome."""
+    def on_stage(name: str):
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is not None:
+                job["stage"] = name
+
+    try:
+        result = do_transcribe(url, mode, api_key, on_stage=on_stage)
+        with jobs_lock:
+            jobs[job_id] = {"status": "done", "stage": "done", **result}
+    except PipelineError as exc:
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": "error", "stage": "error",
+                "error": exc.message, "step": exc.step,
+            }
+    except Exception as exc:  # pragma: no cover - safety net
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": "error", "stage": "error",
+                "error": f"服务器内部出错: {exc}", "step": "server",
+            }
+
+
+def _cleanup_jobs() -> None:
+    now = time.time()
+    with jobs_lock:
+        stale = [
+            jid for jid, job in jobs.items()
+            if now - job.get("created_at", now) > JOB_TTL_SECONDS
+        ]
+        for jid in stale:
+            del jobs[jid]
 
 
 # ---------------------------------------------------------------- routes
@@ -432,16 +504,37 @@ async def transcribe(request: Request):
             },
         )
 
-    try:
-        result = await asyncio.to_thread(do_transcribe, url, mode, api_key)
-    except PipelineError as exc:
+    _cleanup_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "processing", "stage": "parse",
+            "created_at": time.time(),
+        }
+    thread = threading.Thread(
+        target=_run_job, args=(job_id, url, mode, api_key), daemon=True
+    )
+    thread.start()
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "processing"},
+    )
+
+
+@app.get("/jobs/{job_id}")
+async def job_status(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job is None:
         return JSONResponse(
-            status_code=exc.status,
-            content={"ok": False, "error": exc.message, "step": exc.step},
+            status_code=404,
+            content={
+                "status": "error",
+                "error": "任务不存在或已过期，请重新提交",
+                "step": "input",
+            },
         )
-    except Exception as exc:  # pragma: no cover - safety net
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": f"服务器内部出错: {exc}", "step": "server"},
-        )
-    return JSONResponse(status_code=200, content=result)
+    with jobs_lock:
+        snapshot = dict(jobs[job_id])
+    snapshot.pop("created_at", None)
+    return JSONResponse(status_code=200, content=snapshot)

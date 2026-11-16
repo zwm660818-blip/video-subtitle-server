@@ -10,13 +10,14 @@
   {"url": "https://v.douyin.com/xxxx", "mode": "fast"}
   ```
   `mode` 是 `fast`（whisper-large-v3-turbo，约 20 秒）或 `accurate`（whisper-large-v3，更准）。
-  成功返回：
-  ```json
-  {"title": "视频标题", "duration": 544.6,
-   "transcript": "全文……",
-   "segments": [{"start": 0.0, "end": 4.2, "text": "……"}]}
-  ```
-  失败返回 `{"ok": false, "error": "一句话说明", "step": "parse|download|audio|transcribe|config|input"}`。
+  长视频全程要 2–4 分钟，超过平台代理约 2 分钟的单次请求上限（20 分钟视频实测两次 524 超时），所以这个接口只创建一个后台任务、立刻返回 `{"job_id": "...", "status": "processing"}`（HTTP 202），再用下面的接口轮询：
+- `GET /jobs/{job_id}`，每 5 秒查一次，直到 `status` 变成 `done` 或 `error`：
+  - 进行中：`{"status": "processing", "stage": "parse|download|audio|transcribe|proofread"}`（真实进度，页面按这个显示步骤）
+  - 成功：`{"status": "done", "title": "视频标题", "duration": 544.6, "transcript": "全文……", "segments": [{"start": 0.0, "end": 4.2, "text": "……"}], "proofread": {"changed": 8, "batches": 1}}`
+  - 失败：`{"status": "error", "error": "一句话说明", "step": "parse|download|audio|transcribe|config|input"}`
+  - 任务不存在：HTTP 404，`{"status": "error", "error": "任务不存在或已过期，请重新提交"}`
+
+  任务只存在内存里，容器休眠会丢任务，页面遇到这种情况请提示重新提交。任务 1 小时后自动清理。
 
 ## 流程
 
