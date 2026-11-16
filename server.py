@@ -14,11 +14,13 @@ No secret is stored in this code.
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 import httpx
@@ -46,6 +48,8 @@ PROOFREAD_SYSTEM = (
     "结合上下文和整段内容判断。规则：只改错字，不改句式、不增删内容、不润色、不解释；"
     "如果某句话按字面讲不通，或与前后文的意思对不上（比如前面刚提到左探头，后面出现意思不明的防探头），"
     "按上下文推断最合理的词来修正；"
+    "如果某行里的型号、编号与上面列出的反复出现的型号只差一两个字母，优先按反复出现的那个修正"
+    "（例如视频里 CT5 出现多次，某行出现 CP5 很可能是把 T 听成了 P）；"
     "只返回你改动过的行，每行格式“编号. 修正后的文本”；没有改动的行不要返回；"
     "不要输出任何多余内容。"
 )
@@ -249,7 +253,35 @@ def transcribe_file(audio_path: Path, model: str, api_key: str) -> dict:
         raise PipelineError("transcribe", "转写服务返回了无法识别的内容")
 
 
-def _proofread_batch(batch: list[dict], title: str, api_key: str) -> dict[int, str]:
+def _extract_anchors(segments: list[dict]) -> str:
+    """Find model/version codes that recur across the whole transcript.
+
+    Whisper often mishears one letter of a code once (CT5 -> CP5) while
+    getting it right everywhere else. A proofreader that only sees 100
+    segments at a time cannot spot that inconsistency, so the frequent
+    forms are collected up front and handed to every batch as anchors.
+    Only letter+digit tokens count (CT5, 4S, GPT-6); plain words and bare
+    numbers are too common to be useful anchors. Tokens seen at least
+    twice, most frequent first, capped so the prompt stays small.
+    Returns "" when there is nothing worth anchoring.
+    """
+    counts: Counter[str] = Counter()
+    token_re = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+    for seg in segments:
+        for token in token_re.findall(seg.get("text", "")):
+            has_letter = any(c.isalpha() for c in token)
+            has_digit = any(c.isdigit() for c in token)
+            if has_letter and has_digit and len(token) >= 2:
+                counts[token] += 1
+    frequent = [(tok, n) for tok, n in counts.most_common(12) if n >= 2]
+    if not frequent:
+        return ""
+    return "、".join(f"{tok}（{n}次）" for tok, n in frequent)
+
+
+def _proofread_batch(
+    batch: list[dict], title: str, api_key: str, anchors: str = ""
+) -> dict[int, str]:
     """Proofread one batch; returns {1-based index: corrected text}.
 
     Returns only the lines the model changed (sparse output). On any failure
@@ -263,7 +295,10 @@ def _proofread_batch(batch: list[dict], title: str, api_key: str) -> dict[int, s
         "Content-Type": "application/json",
     }
     numbered = "\n".join(f"{i + 1}. {s.get('text', '')}" for i, s in enumerate(batch))
-    user_msg = f"视频标题：{title}\n转写分段：\n{numbered}"
+    user_msg = f"视频标题：{title}\n"
+    if anchors:
+        user_msg += f"视频中反复出现的型号/编号：{anchors}\n"
+    user_msg += f"转写分段：\n{numbered}"
     for attempt in range(4):
         try:
             resp = httpx.post(
@@ -336,11 +371,15 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
     fixed = [dict(s) for s in segments]
     changed = 0
     batches = 0
+    # Anchor terms are computed once over the whole transcript and given to
+    # every batch, so a one-off mishearing (CP5) can be caught against the
+    # form that recurs (CT5) even when the two never share a batch.
+    anchors = _extract_anchors(segments)
     for base in range(0, len(segments), PROOFREAD_BATCH):
         batch = segments[base:base + PROOFREAD_BATCH]
         batches += 1
         try:
-            parsed = _proofread_batch(batch, title, api_key)
+            parsed = _proofread_batch(batch, title, api_key, anchors)
         except Exception:
             parsed = {}
         for idx, text in parsed.items():
