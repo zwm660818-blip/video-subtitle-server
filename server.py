@@ -317,32 +317,39 @@ def _proofread_batch(batch: list[dict], title: str, api_key: str) -> dict[int, s
     return {}
 
 
-def proofread_segments(segments: list[dict], title: str, api_key: str) -> list[dict]:
+def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[list[dict], dict]:
     """Fix Whisper homophone errors with an LLM, keeping timestamps.
 
     Whisper hears sounds and guesses characters, so fast game slang comes out
     wrong in both fast and accurate modes (键位->箭位, 趴键->啪箭, 右探头->防探头).
     A language model reading the whole passage can fix these from context.
     Never raises: on any failure the original segments come back untouched.
+    Returns (segments, stats) where stats counts changed lines and batches.
     """
     if not segments:
-        return segments
+        return segments, {"changed": 0, "batches": 0}
     fixed = [dict(s) for s in segments]
+    changed = 0
+    batches = 0
     for base in range(0, len(segments), PROOFREAD_BATCH):
         batch = segments[base:base + PROOFREAD_BATCH]
+        batches += 1
         try:
             parsed = _proofread_batch(batch, title, api_key)
         except Exception:
             parsed = {}
         for idx, text in parsed.items():
-            fixed[base + idx - 1]["text"] = text
-        # Pace the batches: the free tier is 8000 tokens/min, and a full
-        # batch is ~2000 tokens in + a little out. A short pause keeps us
-        # from burning the minute budget in one burst (except after the
-        # last batch, where there is nothing left to pace for).
+            if fixed[base + idx - 1]["text"] != text:
+                fixed[base + idx - 1]["text"] = text
+                changed += 1
+        # A short pause between batches: the free tier is 8000 tokens/min and
+        # a full batch is ~1500 tokens, so back-to-back batches risk a 429
+        # (which would cost a 65s retry and blow the proxy timeout). Two
+        # seconds is enough to stay under the limit without stalling a
+        # long video past the ~2 minute proxy ceiling.
         if base + PROOFREAD_BATCH < len(segments):
-            time.sleep(8)
-    return fixed
+            time.sleep(2)
+    return fixed, {"changed": changed, "batches": batches}
 
 
 def do_transcribe(url: str, mode: str, api_key: str) -> dict:
@@ -369,8 +376,9 @@ def do_transcribe(url: str, mode: str, api_key: str) -> dict:
                 })
         # Proofread: fix homophone errors from context. Never breaks the
         # transcription itself -- on failure the raw segments are returned.
+        proofread_stats = {"changed": 0, "batches": 0}
         try:
-            segments = proofread_segments(segments, title, api_key)
+            segments, proofread_stats = proofread_segments(segments, title, api_key)
         except Exception:
             pass
         return {
@@ -378,6 +386,7 @@ def do_transcribe(url: str, mode: str, api_key: str) -> dict:
             "duration": round(duration, 1),
             "transcript": "".join(s["text"] for s in segments),
             "segments": segments,
+            "proofread": proofread_stats,
         }
 
 
