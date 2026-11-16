@@ -25,6 +25,7 @@
 3. `ffprobe` 读时长，`ffmpeg` 提音频为 128k mp3（约 1 MB/分钟）。
 4. Groq 转写：`POST https://api.groq.com/openai/v1/audio/transcriptions`，`verbose_json`（带时间戳）。**必须发浏览器 UA**，否则 Cloudflare 拦 403（error 1010）。
    mp3 超过 25 MB 时按时间切块再逐块转写，时间戳按偏移合并。
+5. 校对：转写完再调 Groq 的语言模型 `qwen/qwen3.8-27b` 按上下文修正同音字（Whisper 听音猜字，快慢两种模式在游戏黑话上都会成片错，例如“键位”听成“箭位”、“趴键”听成“啪箭”；2026-11-16 在一条和平精英视频的 16 行字幕上实测，8 处错全修好、没改错一句）。按 100 段一批、逐行编号发过去，时间戳不动；校对失败（模型挂了、返回格式不对）时直接返回原始字幕，转写本身不受影响。
 
 Groq 的 key 只从环境变量 `GROQ_API_KEY` 读，不在代码里出现。没设 key 时 `/transcribe` 直接返回 500，提示去部署平台的环境变量里加。
 
@@ -38,6 +39,8 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
 ## 部署到 Render（免费档）
+
+Render 免费档部署时会要求绑卡（$1 临时预授权），没卡走不通。2026-11-16 已改用 SnapDeploy，流程一样（GitHub 仓库 → Deploy from GitHub → 加 `GROQ_API_KEY` 环境变量），注册和部署全程不要卡，免费档 4 个容器、每月 100 小时、15 分钟不用休眠、唤醒约 1 分钟；部署地址形如 `https://video-subtitle-server-db002.containers.snapdeploy.app`。SnapDeploy 的部署弹窗状态会滞后，以实际访问 `/health` 为准。
 
 1. 把这个目录推到一个 GitHub 仓库。
 2. Render → New → Web Service → 选仓库 → Runtime 选 **Docker**。

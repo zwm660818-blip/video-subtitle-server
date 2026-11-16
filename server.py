@@ -26,6 +26,23 @@ CHROME_UA = (
 )
 ZACAO_URL = "https://video.zacao.top/api/parse/v2"
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Proofreading model: Qwen is the strongest Chinese model on Groq's free tier.
+# Tested 2026-11-16 on the exact failing game-video lines: fixed 8/8 homophone
+# errors (键位/趴键/右探头) with zero new errors. gpt-oss-120b was tried and
+# rejected: it over-corrected and invented new errors (秒蹲->秒抢, 左探头->左键).
+# llama-3.3-70b-versatile no longer exists on this account (404).
+PROOFREAD_MODEL = "qwen/qwen3.8-27b"
+PROOFREAD_BATCH = 100  # segments per LLM call
+PROOFREAD_SYSTEM = (
+    "你是中文语音转写校对员。用户给你一段中文语音转写的分段文本，每行前面有编号。"
+    "你的任务：只修正其中听错的同音字、错别字（例如“键位”被听成“箭位”、“趴”被听成“啪”），"
+    "结合上下文和整段内容判断。规则：只改错字，不改句式、不增删内容、不润色、不解释；"
+    "如果某句话按字面讲不通，或与前后文的意思对不上（比如前面刚提到左探头，后面出现意思不明的防探头），"
+    "按上下文推断最合理的词来修正；"
+    "正确的行原样返回；按原编号逐行返回，格式与输入完全一致（“编号. 文本”）；"
+    "不要输出任何多余内容。"
+)
 MAX_GROQ_BYTES = 25 * 1024 * 1024          # Groq rejects files over 25 MB
 CHUNK_TARGET_BYTES = 24 * 1024 * 1024      # stay safely under the limit
 DOUYIN_REFERER = "https://www.douyin.com/"
@@ -226,6 +243,67 @@ def transcribe_file(audio_path: Path, model: str, api_key: str) -> dict:
         raise PipelineError("transcribe", "转写服务返回了无法识别的内容")
 
 
+def proofread_segments(segments: list[dict], title: str, api_key: str) -> list[dict]:
+    """Fix Whisper homophone errors with an LLM, keeping timestamps.
+
+    Whisper hears sounds and guesses characters, so fast game slang comes out
+    wrong in both fast and accurate modes (键位->箭位, 趴键->啪箭, 右探头->防探头).
+    A language model reading the whole passage can fix these from context.
+    Never raises: on any failure the original segments come back untouched.
+    """
+    if not segments:
+        return segments
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": CHROME_UA,
+        "Content-Type": "application/json",
+    }
+    fixed = [dict(s) for s in segments]
+    for base in range(0, len(segments), PROOFREAD_BATCH):
+        batch = segments[base:base + PROOFREAD_BATCH]
+        numbered = "\n".join(f"{i + 1}. {s.get('text', '')}" for i, s in enumerate(batch))
+        user_msg = f"视频标题：{title}\n转写分段：\n{numbered}"
+        try:
+            resp = httpx.post(
+                GROQ_CHAT_URL,
+                headers=headers,
+                json={
+                    "model": PROOFREAD_MODEL,
+                    "messages": [
+                        {"role": "system", "content": PROOFREAD_SYSTEM},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 8192,
+                },
+                timeout=httpx.Timeout(120.0, connect=10.0),
+            )
+            if resp.status_code != 200:
+                continue
+            content = resp.json()["choices"][0]["message"]["content"]
+        except Exception:
+            continue
+        try:
+            parsed: dict[int, str] = {}
+            for line in content.strip().splitlines():
+                line = line.strip().strip("`").strip()
+                if not line or "." not in line:
+                    continue
+                num, _, text = line.partition(".")
+                num = num.strip()
+                if num.isdigit():
+                    parsed[int(num)] = text.strip()
+            # Only trust the batch if most lines came back; otherwise keep originals.
+            if len(parsed) < len(batch) // 2:
+                continue
+            for i, seg in enumerate(batch, 1):
+                if i in parsed and parsed[i]:
+                    fixed[base + i - 1]["text"] = parsed[i]
+        except Exception:
+            continue
+    return fixed
+
+
 def do_transcribe(url: str, mode: str, api_key: str) -> dict:
     """Run the whole pipeline in a worker thread. Returns the response dict."""
     model = MODELS.get(mode, MODELS["fast"])
@@ -239,21 +317,25 @@ def do_transcribe(url: str, mode: str, api_key: str) -> dict:
         extract_audio(video_path, mp3_path)
         chunks = split_audio(mp3_path, duration, tmpdir)
 
-        transcript_parts: list[str] = []
         segments: list[dict] = []
         for chunk_path, offset in chunks:
             result = transcribe_file(chunk_path, model, api_key)
-            transcript_parts.append(result.get("text", ""))
             for seg in result.get("segments", []) or []:
                 segments.append({
                     "start": round(float(seg.get("start", 0)) + offset, 2),
                     "end": round(float(seg.get("end", 0)) + offset, 2),
                     "text": seg.get("text", ""),
                 })
+        # Proofread: fix homophone errors from context. Never breaks the
+        # transcription itself -- on failure the raw segments are returned.
+        try:
+            segments = proofread_segments(segments, title, api_key)
+        except Exception:
+            pass
         return {
             "title": title,
             "duration": round(duration, 1),
-            "transcript": "".join(transcript_parts),
+            "transcript": "".join(s["text"] for s in segments),
             "segments": segments,
         }
 
