@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -40,7 +41,7 @@ PROOFREAD_SYSTEM = (
     "结合上下文和整段内容判断。规则：只改错字，不改句式、不增删内容、不润色、不解释；"
     "如果某句话按字面讲不通，或与前后文的意思对不上（比如前面刚提到左探头，后面出现意思不明的防探头），"
     "按上下文推断最合理的词来修正；"
-    "正确的行原样返回；按原编号逐行返回，格式与输入完全一致（“编号. 文本”）；"
+    "只返回你改动过的行，每行格式“编号. 修正后的文本”；没有改动的行不要返回；"
     "不要输出任何多余内容。"
 )
 MAX_GROQ_BYTES = 25 * 1024 * 1024          # Groq rejects files over 25 MB
@@ -243,26 +244,22 @@ def transcribe_file(audio_path: Path, model: str, api_key: str) -> dict:
         raise PipelineError("transcribe", "转写服务返回了无法识别的内容")
 
 
-def proofread_segments(segments: list[dict], title: str, api_key: str) -> list[dict]:
-    """Fix Whisper homophone errors with an LLM, keeping timestamps.
+def _proofread_batch(batch: list[dict], title: str, api_key: str) -> dict[int, str]:
+    """Proofread one batch; returns {1-based index: corrected text}.
 
-    Whisper hears sounds and guesses characters, so fast game slang comes out
-    wrong in both fast and accurate modes (键位->箭位, 趴键->啪箭, 右探头->防探头).
-    A language model reading the whole passage can fix these from context.
-    Never raises: on any failure the original segments come back untouched.
+    Returns only the lines the model changed (sparse output). On any failure
+    returns {} (caller keeps the originals). Retries on 429: the free tier
+    for this model allows only 8000 tokens/min, so a long video's batches
+    will hit the limit -- wait out the minute window and try again.
     """
-    if not segments:
-        return segments
     headers = {
         "Authorization": f"Bearer {api_key}",
         "User-Agent": CHROME_UA,
         "Content-Type": "application/json",
     }
-    fixed = [dict(s) for s in segments]
-    for base in range(0, len(segments), PROOFREAD_BATCH):
-        batch = segments[base:base + PROOFREAD_BATCH]
-        numbered = "\n".join(f"{i + 1}. {s.get('text', '')}" for i, s in enumerate(batch))
-        user_msg = f"视频标题：{title}\n转写分段：\n{numbered}"
+    numbered = "\n".join(f"{i + 1}. {s.get('text', '')}" for i, s in enumerate(batch))
+    user_msg = f"视频标题：{title}\n转写分段：\n{numbered}"
+    for attempt in range(4):
         try:
             resp = httpx.post(
                 GROQ_CHAT_URL,
@@ -274,33 +271,77 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> list[d
                         {"role": "user", "content": user_msg},
                     ],
                     "temperature": 0,
-                    "max_tokens": 8192,
+                    "max_tokens": 4096,
                 },
                 timeout=httpx.Timeout(120.0, connect=10.0),
             )
-            if resp.status_code != 200:
+        except Exception:
+            return {}
+        if resp.status_code == 429:
+            wait = 65
+            try:
+                retry_after = int(resp.headers.get("retry-after", "0"))
+                if 0 < retry_after <= 120:
+                    wait = retry_after
+            except ValueError:
+                pass
+            if attempt < 3:
+                time.sleep(wait)
                 continue
+            return {}
+        if resp.status_code != 200:
+            return {}
+        try:
             content = resp.json()["choices"][0]["message"]["content"]
         except Exception:
-            continue
-        try:
-            parsed: dict[int, str] = {}
-            for line in content.strip().splitlines():
-                line = line.strip().strip("`").strip()
-                if not line or "." not in line:
-                    continue
-                num, _, text = line.partition(".")
-                num = num.strip()
-                if num.isdigit():
-                    parsed[int(num)] = text.strip()
-            # Only trust the batch if most lines came back; otherwise keep originals.
-            if len(parsed) < len(batch) // 2:
+            return {}
+        parsed: dict[int, str] = {}
+        for line in content.strip().splitlines():
+            line = line.strip().strip("`").strip()
+            if not line or "." not in line:
                 continue
-            for i, seg in enumerate(batch, 1):
-                if i in parsed and parsed[i]:
-                    fixed[base + i - 1]["text"] = parsed[i]
+            num, _, text = line.partition(".")
+            num = num.strip()
+            text = text.strip()
+            if not num.isdigit() or not text:
+                continue
+            idx = int(num)
+            if not 1 <= idx <= len(batch):
+                continue
+            original = batch[idx - 1].get("text", "")
+            # Guard against a runaway "correction" that rewrites the line.
+            if len(text) > max(3 * len(original), len(original) + 20):
+                continue
+            parsed[idx] = text
+        return parsed
+    return {}
+
+
+def proofread_segments(segments: list[dict], title: str, api_key: str) -> list[dict]:
+    """Fix Whisper homophone errors with an LLM, keeping timestamps.
+
+    Whisper hears sounds and guesses characters, so fast game slang comes out
+    wrong in both fast and accurate modes (键位->箭位, 趴键->啪箭, 右探头->防探头).
+    A language model reading the whole passage can fix these from context.
+    Never raises: on any failure the original segments come back untouched.
+    """
+    if not segments:
+        return segments
+    fixed = [dict(s) for s in segments]
+    for base in range(0, len(segments), PROOFREAD_BATCH):
+        batch = segments[base:base + PROOFREAD_BATCH]
+        try:
+            parsed = _proofread_batch(batch, title, api_key)
         except Exception:
-            continue
+            parsed = {}
+        for idx, text in parsed.items():
+            fixed[base + idx - 1]["text"] = text
+        # Pace the batches: the free tier is 8000 tokens/min, and a full
+        # batch is ~2000 tokens in + a little out. A short pause keeps us
+        # from burning the minute budget in one burst (except after the
+        # last batch, where there is nothing left to pace for).
+        if base + PROOFREAD_BATCH < len(segments):
+            time.sleep(8)
     return fixed
 
 
