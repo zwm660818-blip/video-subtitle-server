@@ -64,3 +64,5 @@ Render 免费档部署时会要求绑卡（$1 临时预授权），没卡走不�
 - Groq 免费档每天 28,800 秒音频（8 小时），超了要按量付费（turbo 约 $0.04/音频小时，v3 约 $0.111/音频小时）。
 - 长视频先下载再转写，20 分钟视频全程约 1 分钟左右。
 - 这是个个人试用后端，CORS 全开，没有做鉴权——别把地址公开到处发。
+
+<!-- redeploy 2026-11-18 07:38: trigger SnapDeploy auto-deploy for language auto-detect + /translate (main 9467d3f) -->
