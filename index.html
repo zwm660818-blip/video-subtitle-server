@@ -129,7 +129,6 @@
     <div style="height:6px"></div>
     <div class="a-row"><span>自动加标点</span><button class="switch on" id="punct-switch" onclick="this.classList.toggle('on')" aria-label="自动加标点开关"></button></div>
     <div class="a-row"><span>转完顺手总结</span><button class="switch" id="summary-switch" onclick="this.classList.toggle('on')" aria-label="转完总结开关"></button></div>
-    <div class="a-row"><span>英文词加中文释义</span><button class="switch on" id="annotate-switch" onclick="toggleAnnotate()" aria-label="英文词加中文释义开关"></button></div>
   </div>
 
   <button class="a-cta" id="cta" onclick="runTranscribe()">开始转字幕</button>
@@ -185,24 +184,39 @@ var LS_TS = 'vts.showTimestamps';
 var LS_RESULT = 'vts.lastResult';
 var LS_JOB = 'vts.pendingJob';
 var LS_HISTORY = 'vts.history';
-var LS_ANNOTATE = 'vts.annotateEnglish';
 var HISTORY_MAX = 20;
 var showTimestamps = true;
-var annotateEnglish = true;   /* 英文词后面加（中文意思），默认开 */
 function storeGet(k){ try { return window.localStorage.getItem(k); } catch(e) { return null; } }
 function storeSet(k, v){ try { window.localStorage.setItem(k, v); } catch(e) {} }
 function storeRemove(k){ try { window.localStorage.removeItem(k); } catch(e) {} }
 if(storeGet(LS_TS) === '0') showTimestamps = false;
-if(storeGet(LS_ANNOTATE) === '0') annotateEnglish = false;
 
-function applyAnnotateSwitch(){
-  var sw = document.getElementById('annotate-switch');
-  if(sw) sw.classList.toggle('on', annotateEnglish);
+/* ---------- 常见英文词释义清理：结果一拿到就去掉这些词后面的中文释义括号 ----------
+   后端校对会给英文词加中文释义，但常见词/品牌/模型名不需要。显示、复制、下载、
+   存历史都用清理后的数据，所以清理在数据入口做，不只改显示。chance 等不在名单里的词不动。 */
+var NO_ANNOTATE_WORDS = ['GPU','CPU','AI','GPT','Claude','Gemini','ChatGPT','Meet','API','WiFi','USB','Windows','Android','Google','Microsoft','Apple','OpenAI','Anthropic','Meta','Amazon','Tesla','Nvidia','Intel','AMD','iPhone','iPad','Mac','MacBook','Chrome','Safari','Firefox','Edge','Zoom','Teams','Slack','Discord','Telegram','WhatsApp','WeChat','Douyin','TikTok','YouTube','Instagram','Facebook','Twitter','Reddit','GitHub','Git','Python','Java','JavaScript','HTML','CSS','SQL','Linux','Docker','Grok','Llama','Astra','Opus','Sonnet','Haiku','Mistral','Qwen','DeepSeek','Kimi','Doubao','GLM','Ernie','Hunyuan'];
+var NO_ANNOTATE_RE = (function(){
+  var sorted = NO_ANNOTATE_WORDS.slice().sort(function(a, b){ return b.length - a.length; });
+  var escaped = sorted.map(function(w){ return w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); });
+  /* 词本身（大小写不敏感）+ 可选连字符后缀（如 GPT-6、GPT-4o、Claude-3.5），
+     后面紧跟（可隔空格）一对全角或半角括号、且括号里至少含一个中文字符时，整段括号去掉 */
+  return new RegExp('\\b((?:' + escaped.join('|') + ')(?:-[A-Za-z0-9]+(?:\\.[A-Za-z0-9]+)?)*)\\s*[\\(\\uFF08][^\\(\\)\\uFF08\\uFF09]*?[\\u4e00-\\u9fff][^\\(\\)\\uFF08\\uFF09]*?[\\)\\uFF09]', 'gi');
+})();
+function stripCommonAnnotations(text){
+  if(typeof text !== 'string' || !text) return text;
+  NO_ANNOTATE_RE.lastIndex = 0;
+  return text.replace(NO_ANNOTATE_RE, '$1');
 }
-function toggleAnnotate(){
-  annotateEnglish = !annotateEnglish;
-  storeSet(LS_ANNOTATE, annotateEnglish ? '1' : '0');
-  applyAnnotateSwitch();
+function cleanResultData(data){
+  if(!data || typeof data !== 'object') return data;
+  if(typeof data.transcript === 'string') data.transcript = stripCommonAnnotations(data.transcript);
+  if(Array.isArray(data.segments)){
+    data.segments.forEach(function(sg){
+      if(sg && typeof sg.text === 'string') sg.text = stripCommonAnnotations(sg.text);
+    });
+  }
+  if(data.result && typeof data.result === 'object') cleanResultData(data.result);
+  return data;
 }
 
 function applyTsSwitch(){
@@ -216,6 +230,7 @@ function toggleTimestamps(){
   if(lastResult) renderLines(lastResult);
 }
 function saveResult(data, url){
+  cleanResultData(data);
   var rec = {
     title: data.title, duration: data.duration,
     segments: data.segments, transcript: data.transcript,
@@ -483,7 +498,7 @@ function postJob(url){
   return fetch(API_BASE + '/transcribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: url, mode: currentMode, annotate: annotateEnglish })
+    body: JSON.stringify({ url: url, mode: currentMode })
   }).then(function(res){
     return res.text().then(function(text){
       var data = null;
@@ -566,7 +581,8 @@ async function pollJob(jobId, deadline){
       if(!result.segments && !result.transcript){
         throw { plain: '服务器说转完了，但里面没有字幕内容。可能是这个视频没有人声。再换一条试试。', raw: out.text ? out.text.slice(0, 200) : '' };
       }
-      return result;
+      /* 结果一拿到就先清理常见英文词的释义括号，后面显示/复制/下载/存历史用的都是干净版 */
+      return cleanResultData(result);
     }
     if(status === 'error' || status === 'failed' || d.ok === false){
       var pe = plainError({ error: d.error || d.message || '', step: d.step || d.stage || '' }, out.res.status);
@@ -651,6 +667,8 @@ function renderLines(data){
   }
 }
 function renderResult(data, url, opts){
+  /* 兜底：从历史/上次结果恢复的旧数据也先清理一遍再显示，保证复制和下载同样干净 */
+  cleanResultData(data);
   lastResult = data;
   var segments = Array.isArray(data.segments) ? data.segments : [];
   var title = data.title || '未命名视频';
@@ -667,13 +685,9 @@ function renderResult(data, url, opts){
 
   /* 校对改了几行：后端给了才显示，没给就不显示 */
   var note = document.getElementById('proofread-note');
-  var changed = (data.proofread && typeof data.proofread.changed === 'number') ? data.proofread.changed : 0;
-  var annotated = (data.proofread && typeof data.proofread.annotated === 'number') ? data.proofread.annotated : 0;
-  var noteParts = [];
-  if(changed > 0) noteParts.push('校对改了 ' + changed + ' 处');
-  if(annotated > 0) noteParts.push('给 ' + annotated + ' 行英文加了中文释义');
-  if(noteParts.length){
-    note.textContent = noteParts.join('，');
+  var changed = (data.proofread && typeof data.proofread.changed === 'number') ? data.proofread.changed : null;
+  if(changed !== null && changed > 0){
+    note.textContent = '校对改了 ' + changed + ' 处';
     note.classList.add('show');
   } else {
     note.textContent = '';
@@ -805,7 +819,6 @@ async function resumeJob(job){
 }
 function restoreOnLoad(){
   applyTsSwitch();
-  applyAnnotateSwitch();
   /* 历史迁移：本地已经存着的上次结果，作为历史里的第一条 */
   var lastSaved = null;
   try { lastSaved = JSON.parse(storeGet(LS_RESULT) || 'null'); } catch(e) {}
