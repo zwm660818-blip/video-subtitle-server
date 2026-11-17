@@ -503,6 +503,9 @@ NO_GLOSS = {
     "tiktok", "youtube", "instagram", "facebook", "twitter", "reddit",
     "github", "git", "python", "java", "javascript", "html", "css",
     "sql", "linux", "docker",
+    # AI model names (also need no explanation)
+    "grok", "llama", "astra", "opus", "sonnet", "haiku", "mistral",
+    "qwen", "deepseek", "kimi", "doubao", "glm", "ernie", "hunyuan",
     # units
     "kg", "km", "cm", "mm", "ml", "gb", "mb", "tb", "hz",
 }
