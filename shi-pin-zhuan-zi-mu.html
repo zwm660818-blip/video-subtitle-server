@@ -1,0 +1,823 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light" />
+<link rel="icon" href="data:," />
+<title>视频转字幕</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:#f6f7f9; color:#111827;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  button,input{ min-height:36px; font-family:inherit; }
+  .page{ max-width:680px; margin:0 auto; padding:22px 16px 40px; }
+
+  .a-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+  .a-title{ font-size:22px; font-weight:800; letter-spacing:-.02em; }
+  .a-avatar{ width:36px;height:36px;border-radius:999px; background:#2563eb; color:#fff; display:grid; place-items:center; font-weight:800; font-size:15px; flex-shrink:0; }
+
+  .a-card{ background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:16px; margin-bottom:12px; }
+  label{ font-size:12px; font-weight:700; color:#6b7280; display:block; margin-bottom:8px; letter-spacing:.02em; }
+  .a-input{ display:flex; gap:8px; }
+  .a-input input{ flex:1; min-width:0; border:1.5px solid #e5e7eb; background:#f9fafb; border-radius:10px; padding:10px 12px; font-size:13px; color:#111827; }
+  .a-clear{ display:none; width:28px; height:28px; min-height:28px; border:0; border-radius:999px; background:#e5e7eb; color:#6b7280; font-size:15px; line-height:1; cursor:pointer; flex-shrink:0; align-self:center; padding:0; }
+  .a-clear.show{ display:block; }
+  .a-video{ display:none; gap:10px; margin-top:12px; background:#f9fafb; border-radius:12px; padding:10px; align-items:center; }
+  .a-video.show{ display:flex; }
+  .a-thumb{ width:54px;height:40px;border-radius:8px; background:#111827; color:#fff; display:grid; place-items:center; font-size:16px; flex-shrink:0; }
+  .a-video b{ font-size:13px; display:block; line-height:1.4; }
+  .a-video span{ font-size:12px; color:#6b7280; }
+
+  .seg{ display:flex; background:#eef0f3; border-radius:10px; padding:3px; gap:3px; }
+  .seg button{ flex:1; border:0; background:transparent; border-radius:8px; font-size:13px; font-weight:600; color:#6b7280; cursor:pointer; padding:7px 4px; }
+  .seg button.on{ background:#fff; color:#111827; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .a-row{ display:flex; justify-content:space-between; align-items:center; padding:9px 0; border-bottom:1px solid #f1f2f4; font-size:14px; }
+  .a-row:last-child{border-bottom:0}
+  .switch{ width:44px;height:26px;border-radius:999px;background:#d1d5db; position:relative; cursor:pointer; flex-shrink:0; border:0; padding:0; min-height:26px; }
+  .switch::after{ content:""; position:absolute; top:3px; left:3px; width:20px;height:20px;border-radius:999px;background:#fff; transition:.15s; }
+  .switch.on{ background:#2563eb; } .switch.on::after{ left:21px; }
+
+  .a-cta{ width:100%; border:0; background:#2563eb; color:#fff; font-size:16px; font-weight:700; border-radius:12px; padding:14px; cursor:pointer; margin:4px 0 12px; }
+  .a-cta:disabled{ opacity:.6 }
+
+  .steps{ display:none; flex-direction:column; gap:0; }
+  .steps.show{display:flex}
+  .step{ display:flex; gap:10px; align-items:flex-start; padding:7px 0; font-size:13.5px; color:#9ca3af; }
+  .step .dot{ width:20px;height:20px;border-radius:999px;border:2px solid #e5e7eb; display:grid; place-items:center; font-size:11px; flex-shrink:0; margin-top:1px; background:#fff; }
+  .step.doing{ color:#111827; font-weight:600; } .step.doing .dot{ border-color:#2563eb; color:#2563eb; animation:pulse 1.1s ease-in-out infinite; }
+  .step.done{ color:#374151; } .step.done .dot{ background:#16a34a; border-color:#16a34a; color:#fff; animation:none; }
+  .step small{ display:block; font-weight:400; color:#9ca3af; font-size:12px; margin-top:2px; line-height:1.5; }
+  @keyframes pulse{ 0%,100%{ box-shadow:0 0 0 0 rgba(37,99,235,.25);} 50%{ box-shadow:0 0 0 5px rgba(37,99,235,0);} }
+  @media (prefers-reduced-motion: reduce){ .step.doing .dot{ animation:none; } }
+  .wait-hint{ display:none; margin-top:10px; padding-top:10px; border-top:1px solid #f1f2f4; font-size:12.5px; color:#6b7280; line-height:1.6; }
+  .wait-hint.show{ display:block; }
+  .wait-hint b{ color:#2563eb; font-variant-numeric:tabular-nums; }
+
+  .err-box{ display:none; background:#fff7f7; border:1px solid #fecaca; border-radius:16px; padding:16px; margin-bottom:12px; }
+  .err-box.show{ display:block; }
+  .err-box .err-title{ font-size:15px; font-weight:800; color:#b91c1c; margin-bottom:6px; }
+  .err-box .err-plain{ font-size:14px; line-height:1.65; color:#374151; }
+  .err-box .err-raw{ font-size:12px; color:#9ca3af; margin-top:8px; word-break:break-all; line-height:1.5; }
+
+  .result{ display:none; } .result.show{display:block}
+  .result-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .result-head label{ margin-bottom:0; }
+  .ts-toggle{ display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:600; color:#6b7280; flex-shrink:0; }
+  .line{ display:flex; gap:10px; padding:9px 0; border-bottom:1px solid #f3f4f6; font-size:14px; line-height:1.65; }
+  .line:last-child{border-bottom:0}
+  .t{ font-variant-numeric:tabular-nums; color:#2563eb; font-weight:700; font-size:12.5px; flex-shrink:0; padding-top:3px; background:none;border:0;cursor:pointer;padding-left:0;padding-right:0; min-height:auto; }
+  .plain-text{ font-size:14px; line-height:1.8; white-space:pre-wrap; word-break:break-word; }
+  .actions{ display:flex; gap:8px; margin:2px 0 12px; flex-wrap:wrap; }
+  .actions button{ flex:1; min-width:100px; border-radius:10px; padding:10px 6px; font-size:13px; font-weight:700; cursor:pointer; }
+  .actions .primary{ background:#111827; color:#fff; border:0; }
+  .actions .ghost{ background:#fff; border:1.5px solid #e5e7eb; color:#111827; }
+  .summary-box{ display:none; margin-top:14px; background:#f9fafb; border-radius:12px; padding:12px 14px; font-size:14px; line-height:1.75; color:#374151; }
+  .summary-box.show{ display:block; }
+  .summary-box b{ display:block; font-size:12px; color:#6b7280; margin-bottom:6px; letter-spacing:.02em; }
+  .proofread-note{ display:none; margin-top:10px; font-size:12.5px; color:#9ca3af; }
+  .proofread-note.show{ display:block; }
+
+  .hist{ font-size:13px; }
+  .hist-row{ display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #eef0f2; cursor:pointer; }
+  .hist-main{ flex:1; min-width:0; }
+  .hist-title{ font-size:13.5px; color:#111827; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .hist-meta{ font-size:12px; color:#9ca3af; margin-top:2px; }
+  .hist-row:last-child{border-bottom:0}
+  .hist-row span{ color:#9ca3af; font-size:12px; white-space:nowrap; }
+  .hist-del{ width:28px; height:28px; min-height:28px; border:0; border-radius:999px; background:#f3f4f6; color:#9ca3af; font-size:16px; line-height:1; cursor:pointer; flex-shrink:0; padding:0; display:grid; place-items:center; }
+  .hist-del:active{ background:#fee2e2; color:#b91c1c; }
+  .hist-empty{ font-size:13px; color:#9ca3af; padding:4px 0 2px; }
+
+  .toast{ position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(20px); background:#111; color:#fff; padding:11px 18px; border-radius:999px; font-size:14px; font-weight:600; opacity:0; pointer-events:none; transition:.25s; z-index:99; max-width:88vw; text-align:center; }
+  .toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="a-head"><div class="a-title">视频转字幕</div><div class="a-avatar">鑫</div></div>
+
+  <div class="a-card">
+    <label>视频链接</label>
+    <div class="a-input">
+      <input id="link-input" placeholder="把抖音等平台的视频链接粘贴到这里" aria-label="视频链接">
+      <button class="a-clear" id="clear-btn" onclick="clearLink()" aria-label="清空输入框">×</button>
+      <button class="a-paste" onclick="pasteLink()">粘贴</button>
+    </div>
+    <div class="a-video" id="video-card">
+      <div class="a-thumb">▶</div>
+      <div><b id="video-title"></b><span id="video-meta"></span></div>
+    </div>
+  </div>
+
+  <div class="a-card hist">
+    <label>历史记录</label>
+    <div id="hist-list"><div class="hist-empty">还没有转过，在上面粘贴一个链接试一次。</div></div>
+  </div>
+
+  <div class="a-card">
+    <label>转写模式</label>
+    <div class="seg" data-seg>
+      <button data-mode="fast" onclick="seg(this)">快 · 20 秒</button>
+      <button class="on" data-mode="accurate" onclick="seg(this)">准 · 1 分钟</button>
+    </div>
+    <div style="height:6px"></div>
+    <div class="a-row"><span>自动加标点</span><button class="switch on" id="punct-switch" onclick="this.classList.toggle('on')" aria-label="自动加标点开关"></button></div>
+    <div class="a-row"><span>转完顺手总结</span><button class="switch" id="summary-switch" onclick="this.classList.toggle('on')" aria-label="转完总结开关"></button></div>
+  </div>
+
+  <button class="a-cta" id="cta" onclick="runTranscribe()">开始转字幕</button>
+
+  <div class="a-card steps" id="steps">
+    <div class="step" data-step><span class="dot">1</span><span>唤醒服务器<small>服务器 15 分钟没人用就会睡着，第一次要等大约 1 分钟它醒过来</small></span></div>
+    <div class="step" data-step><span class="dot">2</span><span>解析链接，拿到视频</span></div>
+    <div class="step" data-step><span class="dot">3</span><span>提取音频，云端转写中<small>视频越长等得越久，9 分钟的视频一般几十秒</small></span></div>
+    <div class="step" data-step><span class="dot">4</span><span>整理字幕，按时间切段</span></div>
+    <div class="wait-hint" id="wait-hint">已经等了 <b id="wait-sec">0</b> 秒，还在处理，别关页面。整个过程最长等 15 分钟。</div>
+    <div class="wait-hint" id="wake-note">正在唤醒服务器，请稍等</div>
+  </div>
+
+  <div class="err-box" id="err-box">
+    <div class="err-title">这次没转成</div>
+    <div class="err-plain" id="err-plain"></div>
+    <div class="err-raw" id="err-raw"></div>
+  </div>
+
+  <div class="a-card result" id="result">
+    <div class="result-head">
+      <label id="result-label">字幕结果</label>
+      <span class="ts-toggle"><span>时间点</span><button class="switch on" id="ts-switch" onclick="toggleTimestamps()" aria-label="显示时间点开关"></button></span>
+    </div>
+    <div class="actions">
+      <button class="primary" onclick="copyAll()">复制全文</button>
+      <button class="ghost" onclick="downloadTxt()">下载 .txt</button>
+      <button class="ghost" onclick="showSummary()">总结</button>
+    </div>
+    <div class="lines" id="lines"></div>
+    <div class="proofread-note" id="proofread-note"></div>
+    <div class="summary-box" id="summary-box"><b>三句总结</b><span id="summary-text"></span></div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+var API_BASE = 'https://video-subtitle-server-db002.containers.snapdeploy.app';
+var TIMEOUT_MS = 15 * 60 * 1000; /* 总超时 15 分钟：唤醒 + 提交任务 + 轮询等结果，长视频校对也要时间 */
+var POLL_MS = 5000;              /* 每 5 秒查一次任务进度 */
+var WAKE_URL = 'https://snapdeploy.dev/api/public/wake/video-subtitle-server-db002'; /* 唤醒接口：只有调它才能把睡着的服务器叫醒，503 唤醒页叫不醒 */
+var HEALTH_POLL_MS = 5000;       /* 叫醒后每 5 秒查一次 /health，确认服务器真的醒了 */
+var WAKE_WAIT_MS = 2 * 60 * 1000; /* 等服务器醒最多等 2 分钟 */
+
+var currentMode = 'accurate';
+var lastResult = null;   /* { title, duration, transcript, segments } */
+var running = false;
+
+/* ---------- 本地保存：时间点开关、上次转好的结果、进行中的任务（刷新不丢） ---------- */
+var LS_TS = 'vts.showTimestamps';
+var LS_RESULT = 'vts.lastResult';
+var LS_JOB = 'vts.pendingJob';
+var LS_HISTORY = 'vts.history';
+var HISTORY_MAX = 20;
+var showTimestamps = true;
+function storeGet(k){ try { return window.localStorage.getItem(k); } catch(e) { return null; } }
+function storeSet(k, v){ try { window.localStorage.setItem(k, v); } catch(e) {} }
+function storeRemove(k){ try { window.localStorage.removeItem(k); } catch(e) {} }
+if(storeGet(LS_TS) === '0') showTimestamps = false;
+
+function applyTsSwitch(){
+  var sw = document.getElementById('ts-switch');
+  if(sw) sw.classList.toggle('on', showTimestamps);
+}
+function toggleTimestamps(){
+  showTimestamps = !showTimestamps;
+  storeSet(LS_TS, showTimestamps ? '1' : '0');
+  applyTsSwitch();
+  if(lastResult) renderLines(lastResult);
+}
+function saveResult(data, url){
+  var rec = {
+    title: data.title, duration: data.duration,
+    segments: data.segments, transcript: data.transcript,
+    proofread: data.proofread, mode: currentMode, url: url,
+    savedAt: Date.now()
+  };
+  try { storeSet(LS_RESULT, JSON.stringify(rec)); } catch(e) {}
+  return rec;
+}
+
+/* ---------- 历史记录：存浏览器本地，最新在最上面，最多 20 条 ---------- */
+function loadHistory(){
+  try {
+    var arr = JSON.parse(storeGet(LS_HISTORY) || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch(e) { return []; }
+}
+function saveHistoryList(list){
+  var arr = list.slice(0, HISTORY_MAX);
+  /* 本地空间不够时，从最旧的开始丢，直到存得下 */
+  while(arr.length){
+    try { window.localStorage.setItem(LS_HISTORY, JSON.stringify(arr)); break; }
+    catch(e){ arr = arr.slice(0, arr.length - 1); }
+  }
+  return arr;
+}
+function pushHistory(rec){
+  var list = loadHistory().filter(function(e){ return e.savedAt !== rec.savedAt; });
+  list.unshift(rec);
+  saveHistoryList(list);
+  renderHistory();
+}
+function deleteHistory(idx){
+  var list = loadHistory();
+  if(idx < 0 || idx >= list.length) return;
+  var removed = list[idx];
+  list.splice(idx, 1);
+  saveHistoryList(list);
+  try {
+    var last = JSON.parse(storeGet(LS_RESULT) || 'null');
+    if(last && removed && last.savedAt === removed.savedAt) storeRemove(LS_RESULT);
+  } catch(e) {}
+  renderHistory();
+}
+function fmtWhen(ts){
+  var d = new Date(ts);
+  function pad(n){ return (n < 10 ? '0' : '') + n; }
+  return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+function renderHistory(){
+  var listEl = document.getElementById('hist-list');
+  if(!listEl) return;
+  var list = loadHistory();
+  listEl.innerHTML = '';
+  if(!list.length){
+    var empty = document.createElement('div'); empty.className = 'hist-empty';
+    empty.textContent = '还没有转过，在上面粘贴一个链接试一次。';
+    listEl.appendChild(empty);
+    return;
+  }
+  list.forEach(function(rec, idx){
+    var row = document.createElement('div'); row.className = 'hist-row';
+    var main = document.createElement('div'); main.className = 'hist-main';
+    var t = document.createElement('div'); t.className = 'hist-title';
+    t.textContent = rec.title || '未命名视频';
+    var meta = document.createElement('div'); meta.className = 'hist-meta';
+    var parts = [];
+    var dur = fmtDuration(rec.duration); if(dur) parts.push(dur);
+    if(rec.savedAt) parts.push(fmtWhen(rec.savedAt));
+    meta.textContent = parts.join(' · ');
+    main.appendChild(t); main.appendChild(meta);
+    var del = document.createElement('button'); del.className = 'hist-del'; del.type = 'button';
+    del.textContent = '×'; del.setAttribute('aria-label', '删除这条记录');
+    del.addEventListener('click', function(ev){ ev.stopPropagation(); deleteHistory(idx); });
+    var arrow = document.createElement('span'); arrow.textContent = '›';
+    row.appendChild(main); row.appendChild(del); row.appendChild(arrow);
+    row.addEventListener('click', function(){ openHistory(idx); });
+    listEl.appendChild(row);
+  });
+}
+function openHistory(idx){
+  var rec = loadHistory()[idx];
+  if(!rec) return;
+  hideError();
+  if(rec.mode) setMode(rec.mode);
+  document.getElementById('link-input').value = rec.url || '';
+  syncClearBtn();
+  /* 打开的这条同时成为“上次结果”，刷新后也直接显示它 */
+  try { storeSet(LS_RESULT, JSON.stringify(rec)); } catch(e) {}
+  renderResult(rec, rec.url || '', { restored: true });
+  document.getElementById('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function savePendingJob(jobId, url){
+  try { storeSet(LS_JOB, JSON.stringify({ jobId: jobId, url: url, mode: currentMode, startedAt: Date.now() })); } catch(e) {}
+}
+function clearPendingJob(){ storeRemove(LS_JOB); }
+function setMode(mode){
+  currentMode = mode;
+  var btns = document.querySelectorAll('[data-seg] button');
+  btns.forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-mode') === mode); });
+}
+
+/* 页面一打开就调一次唤醒接口，让服务器提前醒过来（不用等结果，失败也无所谓） */
+(function wakeUp(){
+  try {
+    fetch(WAKE_URL, { method: 'POST' }).then(function(){}, function(){});
+  } catch(e) {}
+})();
+
+/* ---------- 小工具 ---------- */
+function fmtTime(sec){
+  if(sec === null || sec === undefined || sec === '') return '';
+  if(typeof sec === 'string' && sec.indexOf(':') >= 0) return sec;
+  var s = Math.max(0, Math.floor(Number(sec) || 0));
+  var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  function pad(n){ return (n < 10 ? '0' : '') + n; }
+  return h > 0 ? (h + ':' + pad(m) + ':' + pad(r)) : (pad(m) + ':' + pad(r));
+}
+function fmtDuration(dur){
+  if(dur === null || dur === undefined || dur === '') return '';
+  if(typeof dur === 'string' && dur.indexOf(':') >= 0) return '时长 ' + dur;
+  var s = Number(dur);
+  if(!isNaN(s) && s > 0) return '时长 ' + fmtTime(s);
+  return String(dur);
+}
+function extractUrl(text){
+  if(!text) return '';
+  var m = String(text).match(/https?:\/\/[^\s，。、）】]+/);
+  return m ? m[0] : String(text).trim();
+}
+
+/* ---------- 粘贴 & 模式 ---------- */
+function syncClearBtn(){
+  var v = document.getElementById('link-input').value;
+  document.getElementById('clear-btn').classList.toggle('show', !!v);
+}
+function clearLink(){
+  var input = document.getElementById('link-input');
+  input.value = '';
+  syncClearBtn();
+  input.focus();
+}
+document.getElementById('link-input').addEventListener('input', syncClearBtn);
+/* 剪贴板读不到时的兜底：把光标点进输入框并全选，让用户长按直接粘贴 */
+function pasteFallback(){
+  var input = document.getElementById('link-input');
+  input.focus();
+  try { input.select(); } catch(e) {}
+  try { input.setSelectionRange(0, input.value.length); } catch(e) {}
+  toast('浏览器不让直接读剪贴板，已经帮你点好输入框了，长按它再点粘贴', 4500);
+}
+function pasteLink(){
+  if(navigator.clipboard && navigator.clipboard.readText){
+    navigator.clipboard.readText().then(function(text){
+      if(text){ document.getElementById('link-input').value = text; syncClearBtn(); toast('已粘贴剪贴板里的链接'); }
+      else { toast('剪贴板是空的'); }
+    }, function(){ pasteFallback(); });
+  } else { pasteFallback(); }
+}
+function seg(btn){
+  var group = btn.closest('[data-seg]'); if(!group) return;
+  var btns = group.querySelectorAll('button');
+  for(var i = 0; i < btns.length; i++) btns[i].classList.remove('on');
+  btn.classList.add('on');
+  currentMode = btn.getAttribute('data-mode') || 'fast';
+}
+
+/* ---------- 进度步骤：全部由后端轮询返回的真实 stage 驱动，不再按时间猜 ---------- */
+var waitTimer = null;
+function setStep(idx, state){
+  var steps = document.querySelectorAll('#steps [data-step]');
+  if(idx < 0 || idx >= steps.length) return;
+  var el = steps[idx];
+  el.classList.remove('doing'); el.classList.remove('done');
+  if(state) el.classList.add(state);
+  el.querySelector('.dot').textContent = state === 'done' ? '✓' : String(idx + 1);
+}
+function resetSteps(){
+  var steps = document.querySelectorAll('#steps [data-step]');
+  steps.forEach(function(s, i){
+    s.classList.remove('doing'); s.classList.remove('done');
+    s.querySelector('.dot').textContent = String(i + 1);
+  });
+}
+/* 后端 stage → 四步进度的对应：
+   parse 解析链接 / download 下载视频 → 第 2 步
+   audio 提取音频 / transcribe 转写 → 第 3 步
+   proofread 校对字幕 → 第 4 步（整理字幕）
+   任务还没建起来（提交/唤醒中）→ 第 1 步 */
+function applyStage(stage){
+  var s = String(stage || '').toLowerCase();
+  var doing = 0;
+  if(s === 'parse' || s === 'download') doing = 1;
+  else if(s === 'audio' || s === 'transcribe') doing = 2;
+  else if(s === 'proofread') doing = 3;
+  for(var i = 0; i < 4; i++){
+    if(i < doing) setStep(i, 'done');
+    else if(i === doing) setStep(i, 'doing');
+    else setStep(i, '');
+  }
+}
+function startElapsed(){
+  var hint = document.getElementById('wait-hint');
+  var secEl = document.getElementById('wait-sec');
+  hint.classList.add('show'); secEl.textContent = '0';
+  var start = Date.now();
+  clearInterval(waitTimer);
+  waitTimer = setInterval(function(){ secEl.textContent = String(Math.floor((Date.now() - start) / 1000)); }, 500);
+}
+function finishProgress(){
+  clearInterval(waitTimer);
+  document.getElementById('wait-hint').classList.remove('show');
+  document.getElementById('wake-note').classList.remove('show');
+  setStep(0, 'done'); setStep(1, 'done'); setStep(2, 'done'); setStep(3, 'done');
+}
+function stopProgress(){
+  clearInterval(waitTimer);
+  document.getElementById('wait-hint').classList.remove('show');
+  document.getElementById('wake-note').classList.remove('show');
+}
+function sleepMs(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
+
+/* ---------- 错误显示：把后端原因翻成大白话 ---------- */
+function plainError(data, httpStatus){
+  var raw = (data && data.error) ? String(data.error) : '';
+  var step = (data && data.step) ? String(data.step) : '';
+  var low = (raw + ' ' + step).toLowerCase();
+  var plain = '';
+  if(low.indexOf('groq') >= 0 && (low.indexOf('key') >= 0 || low.indexOf('401') >= 0 || low.indexOf('unauthorized') >= 0)){
+    plain = '转写服务的钥匙（Groq key）不对或者没配好，所以转不了。去 SnapDeploy 的环境变量里检查一下 GROQ_API_KEY 填得对不对。';
+  } else if(low.indexOf('429') >= 0 || low.indexOf('rate') >= 0 || low.indexOf('quota') >= 0 || low.indexOf('limit') >= 0){
+    plain = '转写服务今天用得太多了，额度到上限了。等一会儿，或者等额度恢复了再试。';
+  } else if(step.indexOf('解析') >= 0 || low.indexOf('parse') >= 0 || low.indexOf('resolve') >= 0){
+    plain = '这个链接没解析出来。确认一下链接复制全了，或者换一条视频的分享链接再试。';
+  } else if(step.indexOf('下载') >= 0 || low.indexOf('download') >= 0 || low.indexOf('fetch') >= 0){
+    plain = '视频没下载下来，可能是这个视频要登录才能看，或者平台把下载拦住了。换一条公开视频试试。';
+  } else if(step.indexOf('转写') >= 0 || low.indexOf('transcri') >= 0 || low.indexOf('whisper') >= 0 || low.indexOf('audio') >= 0){
+    plain = '视频拿到了，但转成文字这一步失败了。可能是视频太长、没有人声，或者转写服务临时抽风，过一会儿再试一次。';
+  } else if(httpStatus === 502 || httpStatus === 503 || httpStatus === 504){
+    plain = '服务器还没醒过来或者正忙，等半分钟再点一次开始。';
+  } else if(raw){
+    plain = '卡在了' + (step ? '「' + step + '」这一步' : '处理过程中') + '。下面是服务器给出的原话，可以截图发给 Muse 看。';
+  } else {
+    plain = '服务器没给出具体原因，可能是它还没醒。等半分钟再试一次。';
+  }
+  return { plain: plain, raw: raw, step: step };
+}
+function showError(plain, raw){
+  var box = document.getElementById('err-box');
+  document.getElementById('err-plain').textContent = plain;
+  document.getElementById('err-raw').textContent = raw ? ('服务器原话：' + raw) : '';
+  box.classList.add('show');
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function hideError(){ document.getElementById('err-box').classList.remove('show'); }
+
+/* ---------- 主流程：异步任务模式 ----------
+   1) POST /transcribe 只提交任务，拿回 job_id（HTTP 202），不等字幕
+   2) 每 5 秒 GET /jobs/{job_id} 轮询，stage 是真实进度
+   3) status 为 done 渲染结果，error 按老办法翻成大白话
+   POST 回的不是 JSON（服务器睡着时是 503 唤醒页，503 本身叫不醒它）→ 先调唤醒接口，
+   再每 5 秒查一次 GET /health，返回 200 确认醒了才正式提交；最多等 2 分钟，等不到就报错
+   全程总超时 15 分钟 */
+function postJob(url){
+  return fetch(API_BASE + '/transcribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url, mode: currentMode })
+  }).then(function(res){
+    return res.text().then(function(text){
+      var data = null;
+      try { data = JSON.parse(text); } catch(e) {}
+      return { res: res, data: data, text: text };
+    });
+  });
+}
+function jobIdFrom(out){
+  var data = out.data;
+  if(data.job_id) return data.job_id;
+  if(data.id) return data.id;
+  if(data.ok === false || data.error){
+    var pe = plainError(data, out.res.status);
+    throw { plain: pe.plain, raw: (pe.step ? '步骤：' + pe.step + '；' : '') + pe.raw };
+  }
+  if(!out.res.ok){
+    var pe2 = plainError(data, out.res.status);
+    throw { plain: pe2.plain, raw: pe2.raw || ('HTTP ' + out.res.status) };
+  }
+  throw { plain: '服务器收下了链接，但没给任务编号，没法查进度。等一会儿再试一次。', raw: out.text ? out.text.slice(0, 200) : '' };
+}
+/* 先调唤醒接口把服务器叫醒，再每 5 秒查一次 /health，返回 200 才算真醒了；最多等 2 分钟 */
+async function wakeAndWait(deadline){
+  document.getElementById('wake-note').classList.add('show');
+  try { await fetch(WAKE_URL, { method: 'POST' }); } catch(e) {}
+  var end = Math.min(Date.now() + WAKE_WAIT_MS, deadline);
+  while(Date.now() < end){
+    try {
+      var res = await fetch(API_BASE + '/health', { method: 'GET' });
+      if(res.status === 200) return true;
+    } catch(e) {}
+    if(Date.now() + HEALTH_POLL_MS >= end) break;
+    await sleepMs(HEALTH_POLL_MS);
+  }
+  return false;
+}
+async function submitJob(url, deadline){
+  var out = null;
+  try { out = await postJob(url); } catch(e) { out = null; }
+  if(out && out.data) return jobIdFrom(out);
+  /* 没拿到 JSON：多半是服务器睡着了（503 唤醒页叫不醒它）。先叫醒、确认醒了，再正式提交 */
+  var awake = await wakeAndWait(deadline);
+  if(awake){
+    var out2 = null;
+    try { out2 = await postJob(url); } catch(e) { out2 = null; }
+    if(out2 && out2.data) return jobIdFrom(out2);
+  }
+  throw { plain: '服务器一直没醒过来，等一两分钟再点一次开始。', raw: '已调唤醒接口并等了 2 分钟，服务器都没正常回应' };
+}
+async function pollJob(jobId, deadline){
+  var first = true;
+  while(true){
+    if(!first) await sleepMs(POLL_MS);
+    first = false;
+    if(Date.now() > deadline){
+      throw { plain: '等了整整 15 分钟还没转完，可能是视频太长，或者服务器中途睡着了。等一会儿再试一次。', raw: '任务超时（15 分钟），job_id：' + jobId };
+    }
+    var out = null;
+    try {
+      var res = await fetch(API_BASE + '/jobs/' + encodeURIComponent(jobId), { method: 'GET' });
+      var text = await res.text();
+      var data = null;
+      try { data = JSON.parse(text); } catch(e) {}
+      out = { res: res, data: data, text: text };
+    } catch(e) { out = null; }
+    if(out && out.res && out.res.status === 404){
+      /* 服务器醒着但不认识这个任务：多半是它中途重启过，任务已经不在了 */
+      throw { plain: '上次那个任务已经不在了，服务器可能中途重启过。重新粘贴链接再转一次吧。', raw: '任务不存在（404），job_id：' + jobId };
+    }
+    if(!out || !out.data){
+      /* 这一轮没查到（服务器打盹或网络抖动），下一轮接着查，直到总超时 */
+      continue;
+    }
+    var d = out.data;
+    var status = String(d.status || '').toLowerCase();
+    if(status === 'done' || status === 'success' || status === 'completed'){
+      var result = (d.result && (d.result.segments || d.result.transcript)) ? d.result : d;
+      if(result.proofread === undefined && d.proofread !== undefined) result.proofread = d.proofread;
+      if(!result.segments && !result.transcript){
+        throw { plain: '服务器说转完了，但里面没有字幕内容。可能是这个视频没有人声。再换一条试试。', raw: out.text ? out.text.slice(0, 200) : '' };
+      }
+      return result;
+    }
+    if(status === 'error' || status === 'failed' || d.ok === false){
+      var pe = plainError({ error: d.error || d.message || '', step: d.step || d.stage || '' }, out.res.status);
+      throw { plain: pe.plain, raw: (pe.step ? '步骤：' + pe.step + '；' : '') + pe.raw };
+    }
+    /* 还在跑：用真实 stage 更新四步进度 */
+    applyStage(d.stage || d.step);
+  }
+}
+async function runTranscribe(){
+  if(running) return;
+  var input = document.getElementById('link-input');
+  var url = extractUrl(input.value);
+  if(!url || url.indexOf('http') !== 0){
+    toast('先粘贴一个视频链接再开始');
+    input.focus();
+    return;
+  }
+  running = true;
+  hideError();
+  document.getElementById('result').classList.remove('show');
+  document.getElementById('video-card').classList.remove('show');
+  var cta = document.getElementById('cta');
+  var stepsBox = document.getElementById('steps');
+  stepsBox.classList.add('show');
+  cta.disabled = true; cta.textContent = '转写中，别关页面…';
+  resetSteps();
+  applyStage('');       /* 提交任务阶段：第 1 步进行中 */
+  startElapsed();
+  var deadline = Date.now() + TIMEOUT_MS;
+  try {
+    var jobId = await submitJob(url, deadline);
+    document.getElementById('wake-note').classList.remove('show');
+    /* 新任务开始：旧的保存结果替换掉，并记下任务号，中途刷新也能接着查 */
+    storeRemove(LS_RESULT);
+    savePendingJob(jobId, url);
+    applyStage('parse'); /* 任务建好了，等第一轮真实进度回来再往下推 */
+    var data = await pollJob(jobId, deadline);
+    clearPendingJob();
+    pushHistory(saveResult(data, url));
+    finishProgress();
+    renderResult(data, url);
+    cta.disabled = false; cta.textContent = '再转一遍';
+    running = false;
+  } catch(err) {
+    clearPendingJob();
+    stopProgress();
+    stepsBox.classList.remove('show');
+    cta.disabled = false; cta.textContent = '开始转字幕';
+    running = false;
+    if(err && err.plain){
+      showError(err.plain, err.raw || '');
+    } else {
+      showError('连不上服务器。可能是服务器还在睡觉，或者网络断了一下。等半分钟再点一次开始。', err && err.message ? String(err.message) : '');
+    }
+  }
+}
+
+/* ---------- 渲染真实结果 ---------- */
+/* 只画字幕列表：时间点开关切换时也走这里重画 */
+function renderLines(data){
+  var segments = Array.isArray(data.segments) ? data.segments : [];
+  var lines = document.getElementById('lines');
+  lines.innerHTML = '';
+  if(segments.length){
+    segments.forEach(function(sg){
+      var row = document.createElement('div'); row.className = 'line';
+      if(showTimestamps){
+        var t = document.createElement('button'); t.className = 't'; t.type = 'button';
+        t.textContent = fmtTime(sg.start);
+        t.addEventListener('click', function(){ toast('这一段在原视频 ' + fmtTime(sg.start) + ' 处'); });
+        row.appendChild(t);
+      }
+      var span = document.createElement('span'); span.textContent = sg.text || '';
+      row.appendChild(span);
+      lines.appendChild(row);
+    });
+  } else {
+    var p = document.createElement('div'); p.className = 'plain-text';
+    p.textContent = data.transcript || '';
+    lines.appendChild(p);
+  }
+}
+function renderResult(data, url, opts){
+  lastResult = data;
+  var segments = Array.isArray(data.segments) ? data.segments : [];
+  var title = data.title || '未命名视频';
+
+  /* 视频信息卡 */
+  document.getElementById('video-title').textContent = title;
+  document.getElementById('video-meta').textContent = fmtDuration(data.duration);
+  document.getElementById('video-card').classList.add('show');
+
+  /* 结果标题 */
+  document.getElementById('result-label').textContent = '字幕结果 · 共 ' + (segments.length ? segments.length + ' 段' : '全文');
+
+  renderLines(data);
+
+  /* 校对改了几行：后端给了才显示，没给就不显示 */
+  var note = document.getElementById('proofread-note');
+  var changed = (data.proofread && typeof data.proofread.changed === 'number') ? data.proofread.changed : null;
+  if(changed !== null && changed > 0){
+    note.textContent = '校对改了 ' + changed + ' 处';
+    note.classList.add('show');
+  } else {
+    note.textContent = '';
+    note.classList.remove('show');
+  }
+
+  document.getElementById('summary-box').classList.remove('show');
+  var result = document.getElementById('result');
+  result.classList.add('show');
+  if(!opts || !opts.restored){
+    result.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    toast('转好了');
+  }
+
+  if(document.getElementById('summary-switch').classList.contains('on')) showSummary();
+}
+
+/* ---------- 复制 / 下载 / 总结（都基于真实转写结果） ---------- */
+function fullText(){
+  if(!lastResult) return '';
+  if(!showTimestamps){
+    var segs = lastResult.segments || [];
+    if(segs.length) return segs.map(function(s){ return s.text || ''; }).join('\n');
+    return lastResult.transcript || '';
+  }
+  if(lastResult.transcript) return lastResult.transcript;
+  return (lastResult.segments || []).map(function(s){ return '[' + fmtTime(s.start) + '] ' + (s.text || ''); }).join('\n');
+}
+function timedText(){
+  if(!lastResult) return '';
+  var segs = lastResult.segments || [];
+  if(segs.length) return segs.map(function(s){ return showTimestamps ? ('[' + fmtTime(s.start) + '] ' + (s.text || '')) : (s.text || ''); }).join('\n');
+  return lastResult.transcript || '';
+}
+function copyAll(){
+  if(!lastResult){ toast('还没有转写结果'); return; }
+  var text = fullText();
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){ toast('全文已复制，去粘贴吧'); }, function(){ toast('复制失败，长按字幕手动复制'); });
+  } else { toast('长按字幕手动复制'); }
+}
+function saveFile(name, content, type){
+  var blob = new Blob([content], { type: type || 'text/plain;charset=utf-8' });
+  var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); }, 2000);
+}
+function downloadTxt(){
+  if(!lastResult){ toast('还没有转写结果'); return; }
+  var title = (lastResult.title || '视频').replace(/[\\/:*?"<>|]/g, '').slice(0, 40) || '视频';
+  var head = (lastResult.title || '') + (lastResult.duration ? '\n时长 ' + fmtTime(lastResult.duration) : '') + '\n\n';
+  var content = head + timedText();
+  var fileName = title + '-字幕.txt';
+  /* 手机上优先走系统分享：内置浏览器直接下载存不进“文件”，分享里选“存储到文件”可以自己选位置保存 */
+  var file = null;
+  try { file = new File([content], fileName, { type: 'text/plain;charset=utf-8' }); } catch(e) {}
+  if(file && navigator.share && navigator.canShare){
+    var shareData = { files: [file] };
+    var canShareFile = false;
+    try { canShareFile = navigator.canShare(shareData); } catch(e) {}
+    if(canShareFile){
+      navigator.share(shareData).then(function(){
+        toast('已弹出分享，选“存储到文件”就能保存');
+      }, function(err){
+        if(err && err.name === 'AbortError') return; /* 用户自己关掉了分享面板，不再改走下载 */
+        saveFile(fileName, content);
+        toast('已下载 .txt 文件');
+      });
+      return;
+    }
+  }
+  /* 不支持分享文件的浏览器（比如电脑浏览器）保持原来的直接下载 */
+  saveFile(fileName, content);
+  toast('已下载 .txt 文件');
+}
+/* 简单三句总结：从真实字幕里挑开头、中间、结尾的代表句，不编内容 */
+function showSummary(){
+  if(!lastResult){ toast('先转出字幕再总结'); return; }
+  var texts = [];
+  if(lastResult.segments && lastResult.segments.length){
+    texts = lastResult.segments.map(function(s){ return (s.text || '').trim(); }).filter(Boolean);
+  } else if(lastResult.transcript){
+    texts = lastResult.transcript.split(/[。！？\n]+/).map(function(s){ return s.trim(); }).filter(Boolean);
+  }
+  if(!texts.length){ toast('字幕是空的，没法总结'); return; }
+  var picks;
+  if(texts.length <= 3){ picks = texts; }
+  else { picks = [texts[0], texts[Math.floor(texts.length / 2)], texts[texts.length - 1]]; }
+  document.getElementById('summary-text').textContent = picks.join(' ');
+  document.getElementById('summary-box').classList.add('show');
+}
+
+/* ---------- 刷新恢复：接着跑没跑完的任务，或直接显示上次的结果 ---------- */
+async function resumeJob(job){
+  if(running) return;
+  running = true;
+  hideError();
+  document.getElementById('result').classList.remove('show');
+  if(job.mode) setMode(job.mode);
+  if(job.url){ document.getElementById('link-input').value = job.url; syncClearBtn(); }
+  var cta = document.getElementById('cta');
+  var stepsBox = document.getElementById('steps');
+  stepsBox.classList.add('show');
+  cta.disabled = true; cta.textContent = '转写中，别关页面…';
+  resetSteps();
+  applyStage('');
+  startElapsed();
+  var deadline = Date.now() + TIMEOUT_MS;
+  try {
+    var data = await pollJob(job.jobId, deadline);
+    clearPendingJob();
+    pushHistory(saveResult(data, job.url || ''));
+    finishProgress();
+    renderResult(data, job.url || '');
+    cta.disabled = false; cta.textContent = '再转一遍';
+    running = false;
+  } catch(err) {
+    clearPendingJob();
+    stopProgress();
+    stepsBox.classList.remove('show');
+    cta.disabled = false; cta.textContent = '开始转字幕';
+    running = false;
+    if(err && err.plain){
+      showError(err.plain, err.raw || '');
+    } else {
+      showError('连不上服务器。可能是服务器还在睡觉，或者网络断了一下。等半分钟再点一次开始。', err && err.message ? String(err.message) : '');
+    }
+  }
+}
+function restoreOnLoad(){
+  applyTsSwitch();
+  /* 历史迁移：本地已经存着的上次结果，作为历史里的第一条 */
+  var lastSaved = null;
+  try { lastSaved = JSON.parse(storeGet(LS_RESULT) || 'null'); } catch(e) {}
+  if(lastSaved && (lastSaved.segments || lastSaved.transcript)){
+    var hist = loadHistory();
+    var already = hist.some(function(e){ return e.savedAt === lastSaved.savedAt; });
+    if(!already){
+      hist.unshift(lastSaved);
+      saveHistoryList(hist);
+    }
+  }
+  renderHistory();
+  var job = null;
+  try { job = JSON.parse(storeGet(LS_JOB) || 'null'); } catch(e) {}
+  if(job && job.jobId){ resumeJob(job); return; }
+  var saved = null;
+  try { saved = JSON.parse(storeGet(LS_RESULT) || 'null'); } catch(e) {}
+  if(saved && (saved.segments || saved.transcript)){
+    if(saved.url){ document.getElementById('link-input').value = saved.url; syncClearBtn(); }
+    if(saved.mode) setMode(saved.mode);
+    renderResult(saved, saved.url || '', { restored: true });
+  }
+}
+restoreOnLoad();
+
+/* Toast */
+var toastTimer;
+function toast(msg, ms){
+  var el = document.getElementById('toast'); el.textContent = msg; el.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(function(){ el.classList.remove('show'); }, ms || 2200);
+}
+</script>
+</body>
+</html>
