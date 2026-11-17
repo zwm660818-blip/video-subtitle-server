@@ -42,6 +42,15 @@ GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 # llama-3.3-70b-versatile no longer exists on this account (404).
 PROOFREAD_MODEL = "qwen/qwen3.8-27b"
 PROOFREAD_BATCH = 100  # segments per LLM call
+TRANSLATE_BATCH = 50  # segments per LLM call (translation is heavier)
+TRANSLATE_SYSTEM = (
+    "你是英中翻译。用户给你一段英文语音转写的分段文本，每行前面有编号。"
+    "你的任务：把每行翻译成中文，保持原意，不增删内容、不润色、不解释；"
+    "人名、地名、品牌、型号、专有名词保留英文原文；"
+    "日期、数字按中文习惯写（例如 October 12 -> 10月12日）；"
+    "只返回你翻译过的行，每行格式“编号. 翻译后的文本”；没有翻译的行不要返回；"
+    "不要输出任何多余内容。"
+)
 PROOFREAD_SYSTEM = (
     "你是中文语音转写校对员。用户给你一段中文语音转写的分段文本，每行前面有编号。"
     "你的任务：只修正其中听错的同音字、错别字（例如“键位”被听成“箭位”、“趴”被听成“啪”），"
@@ -825,3 +834,117 @@ async def job_status(job_id: str):
         snapshot = dict(jobs[job_id])
     snapshot.pop("created_at", None)
     return JSONResponse(status_code=200, content=snapshot)
+
+
+# ---------------------------------------------------------------- translate
+def _translate_batch(batch: list[dict], api_key: str) -> dict[int, str]:
+    """Translate one batch; returns {1-based index: translated text}.
+
+    Same sparse-output + 429-retry shape as _proofread_batch: on any
+    failure returns {} and the caller keeps the original English lines.
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": CHROME_UA,
+        "Content-Type": "application/json",
+    }
+    numbered = "\n".join(f"{i + 1}. {s.get('text', '')}" for i, s in enumerate(batch))
+    for attempt in range(4):
+        try:
+            resp = httpx.post(
+                GROQ_CHAT_URL,
+                headers=headers,
+                json={
+                    "model": PROOFREAD_MODEL,
+                    "messages": [
+                        {"role": "system", "content": TRANSLATE_SYSTEM},
+                        {"role": "user", "content": f"英文分段：\n{numbered}"},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 4096,
+                },
+                timeout=httpx.Timeout(120.0, connect=10.0),
+            )
+        except Exception:
+            return {}
+        if resp.status_code == 429:
+            wait = 65
+            try:
+                retry_after = int(resp.headers.get("retry-after", "0"))
+                if 0 < retry_after <= 120:
+                    wait = retry_after
+            except ValueError:
+                pass
+            if attempt < 3:
+                time.sleep(wait)
+                continue
+            return {}
+        if resp.status_code != 200:
+            return {}
+        try:
+            content = resp.json()["choices"][0]["message"]["content"]
+        except Exception:
+            return {}
+        parsed: dict[int, str] = {}
+        for line in content.strip().splitlines():
+            line = line.strip().strip("`").strip()
+            if not line or "." not in line:
+                continue
+            num, _, text = line.partition(".")
+            num = num.strip()
+            text = text.strip()
+            if not num.isdigit() or not text:
+                continue
+            idx = int(num)
+            if not 1 <= idx <= len(batch):
+                continue
+            original = batch[idx - 1].get("text", "")
+            if len(text) > max(3 * len(original), len(original) + 20):
+                continue
+            parsed[idx] = text
+        return parsed
+    return {}
+
+
+@app.post("/translate")
+def translate(body: dict):
+    """Translate English segments to Chinese, one-to-one, keeping timestamps.
+
+    Body: {"segments": [{"start": float, "end": float, "text": str}, ...]}.
+    Returns {"segments": [...] } with the same start/end and translated text.
+    Lines the model doesn't return keep their original English.
+    """
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "服务器没有设置 GROQ_API_KEY"},
+        )
+    segments = body.get("segments") or []
+    if not isinstance(segments, list) or not segments:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "没有可翻译的字幕段"},
+        )
+    if len(segments) > 2000:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "字幕段太多（超过 2000 段），请分段翻译"},
+        )
+    out: list[dict] = []
+    for base in range(0, len(segments), TRANSLATE_BATCH):
+        batch = segments[base:base + TRANSLATE_BATCH]
+        try:
+            parsed = _translate_batch(batch, api_key)
+        except Exception:
+            parsed = {}
+        for i, seg in enumerate(batch):
+            text = parsed.get(i + 1, seg.get("text", ""))
+            out.append({
+                "start": seg.get("start", 0),
+                "end": seg.get("end", 0),
+                "text": text,
+            })
+        if base + TRANSLATE_BATCH < len(segments):
+            time.sleep(2)
+    return JSONResponse(status_code=200, content={"segments": out})
