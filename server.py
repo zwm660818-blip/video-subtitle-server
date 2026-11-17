@@ -272,13 +272,51 @@ def split_audio(mp3_path: Path, duration: float, tmpdir: Path) -> list[tuple[Pat
     return chunks
 
 
-def transcribe_file(audio_path: Path, model: str, api_key: str) -> dict:
-    """Step 4: one Groq transcription call (verbose_json -> segments)."""
+# Whisper verbose_json returns the detected language as a name
+# ("english", "chinese", ...). Groq's `language` parameter wants an
+# ISO 639-1 code, so map the common names back to codes. Anything
+# unmapped falls back to auto-detect (omit the parameter).
+_LANG_NAME_TO_CODE = {
+    "english": "en", "chinese": "zh", "japanese": "ja", "korean": "ko",
+    "spanish": "es", "french": "fr", "german": "de", "italian": "it",
+    "portuguese": "pt", "russian": "ru", "arabic": "ar", "hindi": "hi",
+    "indonesian": "id", "vietnamese": "vi", "thai": "th", "turkish": "tr",
+    "dutch": "nl", "polish": "pl", "ukrainian": "uk", "swedish": "sv",
+}
+
+
+def _detect_lang_code(result: dict) -> str:
+    """Normalize Whisper's detected language to an ISO 639-1 code (or "")."""
+    lang = (result.get("language") or "").strip().lower()
+    if not lang:
+        return ""
+    if len(lang) == 2 and lang.isalpha():
+        return lang
+    return _LANG_NAME_TO_CODE.get(lang, "")
+
+
+def _cjk_ratio(text: str) -> float:
+    """Fraction of CJK characters among letters in text (0 when no text)."""
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    letters = sum(1 for ch in text if ch.isalpha())
+    total = cjk + letters
+    return (cjk / total) if total else 0.0
+
+
+def transcribe_file(audio_path: Path, model: str, api_key: str, language: str = None) -> dict:
+    """Step 4: one Groq transcription call (verbose_json -> segments).
+
+    language: ISO 639-1 code to force, or None to let Whisper auto-detect.
+    Forcing "zh" on an English video makes Whisper translate the English
+    into garbled Chinese (e.g. "December 12, 2026" -> "在12月12日2026年"),
+    so callers auto-detect from the first chunk instead.
+    """
     with open(audio_path, "rb") as f:
         files = {"file": (audio_path.name, f, "audio/mpeg")}
         data = {
             "model": model,
-            "language": "zh",
             # NOTE: do NOT add a `prompt` here. Tested 2026-11-17: an
             # instructional bilingual prompt ("中文写中文，英文写英文…")
             # makes Whisper echo the prompt itself ("中文写中文，") instead
@@ -601,42 +639,57 @@ def do_transcribe(
 
         stage("transcribe")
         segments: list[dict] = []
+        detected_lang = ""
         for chunk_path, offset in chunks:
-            result = transcribe_file(chunk_path, model, api_key)
+            # First chunk auto-detects the language; the rest reuse it so
+            # a mixed-language video doesn't flip languages mid-way.
+            result = transcribe_file(chunk_path, model, api_key, language=detected_lang or None)
+            if not detected_lang:
+                detected_lang = _detect_lang_code(result)
             for seg in result.get("segments", []) or []:
                 segments.append({
                     "start": round(float(seg.get("start", 0)) + offset, 2),
                     "end": round(float(seg.get("end", 0)) + offset, 2),
                     "text": seg.get("text", ""),
                 })
+        # The Chinese proofreader, the English-gloss annotator and the
+        # Traditional->Simplified pass all assume a Chinese transcript.
+        # On a non-Chinese video (e.g. an English documentary) they would
+        # mangle the English, so skip them and return the raw transcript.
+        # is_chinese: detected language is Chinese, or the transcript is
+        # mostly CJK (covers a first chunk that was silent/music).
+        full_text = "".join(s.get("text", "") for s in segments)
+        is_chinese = (detected_lang in ("zh", "chinese")) or _cjk_ratio(full_text) > 0.3
         # Proofread: fix homophone errors from context. Never breaks the
         # transcription itself -- on failure the raw segments are returned.
         stage("proofread")
         proofread_stats = {"changed": 0, "batches": 0}
-        try:
-            segments, proofread_stats = proofread_segments(segments, title, api_key)
-        except Exception:
-            pass
-        # Optional: put （中文意思） after English words. Runs after proofreading
-        # so misheard English has already been restored. It reuses the
-        # "proofread" stage name on purpose: the page only knows the stages
-        # parse/download/audio/transcribe/proofread, and an unknown name would
-        # make its progress steps jump back to step 1.
-        if annotate:
+        if is_chinese:
             try:
-                segments, annotated = annotate_segments(segments, title, api_key)
-                proofread_stats["annotated"] = annotated
+                segments, proofread_stats = proofread_segments(segments, title, api_key)
             except Exception:
                 pass
-        # Normalize everything to Simplified Chinese: Whisper (language="zh")
-        # often outputs Traditional, and the proofreader doesn't rewrite lines
-        # it thinks are already right, so Traditional slips through. This is
-        # the final guarantee -- it runs after proofreading and annotating.
-        for s in segments:
-            s["text"] = _to_simplified(s.get("text", ""))
+            # Optional: put （中文意思） after English words. Runs after proofreading
+            # so misheard English has already been restored. It reuses the
+            # "proofread" stage name on purpose: the page only knows the stages
+            # parse/download/audio/transcribe/proofread, and an unknown name would
+            # make its progress steps jump back to step 1.
+            if annotate:
+                try:
+                    segments, annotated = annotate_segments(segments, title, api_key)
+                    proofread_stats["annotated"] = annotated
+                except Exception:
+                    pass
+            # Normalize everything to Simplified Chinese: Whisper (language="zh")
+            # often outputs Traditional, and the proofreader doesn't rewrite lines
+            # it thinks are already right, so Traditional slips through. This is
+            # the final guarantee -- it runs after proofreading and annotating.
+            for s in segments:
+                s["text"] = _to_simplified(s.get("text", ""))
         return {
             "title": title,
             "duration": round(duration, 1),
+            "language": detected_lang or "",
             "transcript": "".join(s["text"] for s in segments),
             "segments": segments,
             "proofread": proofread_stats,
