@@ -158,6 +158,7 @@
       <button class="primary" onclick="copyAll()">复制全文</button>
       <button class="ghost" onclick="downloadTxt()">下载 .txt</button>
       <button class="ghost" onclick="showSummary()">总结</button>
+      <button class="ghost" id="translate-btn" style="display:none" onclick="toggleTranslate()">翻译成中文</button>
     </div>
     <div class="lines" id="lines"></div>
     <div class="proofread-note" id="proofread-note"></div>
@@ -684,6 +685,14 @@ function renderResult(data, url, opts){
   /* 兜底：从历史/上次结果恢复的旧数据也先清理一遍再显示，保证复制和下载同样干净 */
   cleanResultData(data);
   lastResult = data;
+  /* 恢复翻译状态：本地存的记录若带原文，说明上次停在译文 */
+  if(Array.isArray(data._origSegments) && data._origSegments.length){
+    originalSegments = data._origSegments;
+    showingTranslation = true;
+  } else {
+    originalSegments = null;
+    showingTranslation = false;
+  }
   var segments = Array.isArray(data.segments) ? data.segments : [];
   var title = data.title || '未命名视频';
 
@@ -696,6 +705,7 @@ function renderResult(data, url, opts){
   document.getElementById('result-label').textContent = '字幕结果 · 共 ' + (segments.length ? segments.length + ' 段' : '全文');
 
   renderLines(data);
+  updateTranslateBtn();
 
   /* 校对改了几行：后端给了才显示，没给就不显示 */
   var note = document.getElementById('proofread-note');
@@ -792,6 +802,163 @@ function showSummary(){
   else { picks = [texts[0], texts[Math.floor(texts.length / 2)], texts[texts.length - 1]]; }
   document.getElementById('summary-text').textContent = picks.join(' ');
   document.getElementById('summary-box').classList.add('show');
+}
+
+/* ---------- 翻译成中文：只有英文结果才显示按钮；正文内容优先判断 ----------
+   按钮逻辑：英文结果显示“翻译成中文”；点后先试一次后端 /translate，通了用它，
+   不通改走页面直连（Google gtx 批量 → MyMemory 批量，整批对不齐逐段补翻），
+   时间点不变；翻译后按钮变成“查看原文”，再点切回英文原文。 */
+var showingTranslation = false;
+var originalSegments = null;  /* 翻译前保存的英文原文段 */
+function isEnglishResult(data){
+  var text = '';
+  if(data){
+    if(Array.isArray(data.segments) && data.segments.length){
+      text = data.segments.map(function(s){ return s.text || ''; }).join(' ');
+    } else if(typeof data.transcript === 'string'){
+      text = data.transcript;
+    }
+  }
+  var latin = (text.match(/[A-Za-z]/g) || []).length;
+  var cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  /* 正文够长时只看内容：拉丁字母占主导就是英文 */
+  if(latin + cjk >= 20){
+    return latin > cjk * 2;
+  }
+  /* 正文太短才参考后端给的 language */
+  if(data && data.language){
+    var lang = String(data.language).toLowerCase();
+    if(lang === 'en' || lang.indexOf('en') === 0) return true;
+    if(lang === 'zh' || lang.indexOf('zh') === 0) return false;
+  }
+  return latin > 10;
+}
+function updateTranslateBtn(){
+  var btn = document.getElementById('translate-btn');
+  if(!btn) return;
+  if(showingTranslation){
+    btn.style.display = '';
+    btn.textContent = '查看原文';
+    return;
+  }
+  if(lastResult && isEnglishResult(lastResult)){
+    btn.style.display = '';
+    btn.textContent = '翻译成中文';
+  } else {
+    btn.style.display = 'none';
+  }
+}
+/* Google gtx 免费翻译（无 key）：批量传多个 q，返回 data[0][i][0] 是第 i 段译文 */
+function gtxBatch(texts){
+  var url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t';
+  texts.forEach(function(t){ url += '&q=' + encodeURIComponent(t); });
+  return fetch(url).then(function(res){
+    if(!res.ok) throw new Error('gtx ' + res.status);
+    return res.json();
+  }).then(function(data){
+    var arr = (data && data[0]) || [];
+    var out = [];
+    for(var i = 0; i < texts.length; i++){
+      var seg = arr[i];
+      out.push(seg && seg[0] ? seg[0] : null);
+    }
+    return out;
+  });
+}
+function gtxOne(text){
+  return gtxBatch([text]).then(function(out){ return out[0]; });
+}
+/* MyMemory 免费翻译（无 key）：单段 */
+function myMemoryOne(text){
+  var url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=en|zh-CN';
+  return fetch(url).then(function(res){
+    if(!res.ok) throw new Error('mymemory ' + res.status);
+    return res.json();
+  }).then(function(data){
+    var t = data && data.responseData && data.responseData.translatedText;
+    if(!t || /QUERY LENGTH LIMIT/i.test(t) || /MYMEMORY WARNING/i.test(t)) throw new Error('mymemory empty');
+    return t;
+  });
+}
+/* 客户端直连翻译：Google gtx 批量 → MyMemory 批量（分隔符合并一次翻）→ 逐段补翻 */
+function translateTextsClientSide(texts){
+  var SEP = '\n@@SEG@@\n';
+  function aligned(out){ return Array.isArray(out) && out.length === texts.length && out.every(function(t){ return typeof t === 'string' && t.length > 0; }); }
+  return gtxBatch(texts).then(function(out){
+    if(aligned(out)) return out;
+    throw new Error('gtx batch misaligned');
+  }).catch(function(){
+    var joined = texts.join(SEP);
+    return myMemoryOne(joined).then(function(t){
+      var parts = t.split(SEP);
+      if(parts.length === texts.length) return parts;
+      throw new Error('mymemory batch misaligned');
+    });
+  }).catch(function(){
+    var jobs = texts.map(function(t){
+      return gtxOne(t).catch(function(){ return myMemoryOne(t); }).catch(function(){ return t; });
+    });
+    return Promise.all(jobs);
+  });
+}
+async function toggleTranslate(){
+  if(!lastResult){ toast('还没有转写结果'); return; }
+  var btn = document.getElementById('translate-btn');
+  /* 正在看译文：切回原文 */
+  if(showingTranslation){
+    if(originalSegments){
+      lastResult.segments = originalSegments;
+      lastResult.transcript = originalSegments.map(function(s){ return s.text || ''; }).join('\n');
+      originalSegments = null;
+    }
+    delete lastResult._origSegments;
+    showingTranslation = false;
+    renderLines(lastResult);
+    updateTranslateBtn();
+    try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
+    return;
+  }
+  var segs = lastResult.segments || [];
+  if(!segs.length){ toast('这条没有分段，没法翻译'); return; }
+  if(btn) btn.textContent = '翻译中…';
+  var translated = null;
+  /* 先试一次后端 /translate，通了优先用它 */
+  try {
+    var res = await fetch(API_BASE + '/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segments: segs.map(function(s){ return { start: s.start, end: s.end, text: s.text }; }) })
+    });
+    if(res.ok){
+      var data = await res.json();
+      var arr = data.segments || data.result || null;
+      if(Array.isArray(arr) && arr.length === segs.length){
+        translated = arr.map(function(s){ return s.text || ''; });
+      }
+    }
+  } catch(e) { /* 后端不可用就走客户端直连 */ }
+  if(!translated){
+    try {
+      translated = await translateTextsClientSide(segs.map(function(s){ return s.text || ''; }));
+    } catch(e) { translated = null; }
+  }
+  if(!translated || !translated.length){
+    toast('翻译服务暂不可用，稍后再试');
+    updateTranslateBtn();
+    return;
+  }
+  /* 保存原文，换上译文（时间点不变），原文也存进记录、刷新后还能切回 */
+  originalSegments = segs.map(function(s){ return { start: s.start, end: s.end, text: s.text }; });
+  lastResult._origSegments = originalSegments;
+  lastResult.segments = segs.map(function(s, i){
+    return { start: s.start, end: s.end, text: translated[i] || s.text };
+  });
+  lastResult.transcript = lastResult.segments.map(function(s){ return s.text; }).join('\n');
+  showingTranslation = true;
+  renderLines(lastResult);
+  updateTranslateBtn();
+  try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
+  toast('已翻译成中文');
 }
 
 /* ---------- 刷新恢复：接着跑没跑完的任务，或直接显示上次的结果 ---------- */
