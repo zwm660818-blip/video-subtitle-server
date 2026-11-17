@@ -63,6 +63,7 @@ PROOFREAD_SYSTEM = (
     "但“参加个趴”“开个趴”“去个趴”这种搭配里，“趴”是 party（派对、聚会）的音译，"
     "要改成 party（例如前后在讲论坛、合影、社交场合时，“我去参加个趴”应改为“我去参加个party”）；"
     "已经写对的英文单词不要改成中文，也不要改动；"
+    "输出必须是简体中文，不要出现繁体字；"
     "只返回你改动过的行，每行格式“编号. 修正后的文本”；没有改动的行不要返回；"
     "不要输出任何多余内容。"
 )
@@ -77,6 +78,8 @@ ANNOTATE_SYSTEM = (
     "规则：中文意思要简短（一般 2 到 6 个字），按这句话的上下文取最贴切的意思；"
     "整个英文短语（如 face to face）作为一个整体只标一个意思，不要拆开；"
     "人名、品牌名、型号编号、缩写、字母加数字的写法（如 CT5、iPhone、ID、GPT-6、OK）不用加释义，保持原样；"
+    "常见科技名词、公司名、产品名也不用加释义，例如 GPU、CPU、AI、GPT、Claude、Gemini、ChatGPT、Meet、API、WiFi、USB、Windows、Android、Google、Microsoft、Apple、OpenAI，这些词大家都知道是什么意思；"
+    "括号里的中文意思用简体中文，不要用繁体字；"
     "已经带有括号解释的英文词不要重复加；"
     "除了加括号释义，不要改动这一行的任何其他字，不要改标点，不要改中文，不要润色；"
     "只返回你加过释义的行，每行格式“编号. 加好释义的文本”；没有英文词需要加释义的行不要返回；"
@@ -90,6 +93,27 @@ MODELS = {
     "fast": "whisper-large-v3-turbo",
     "accurate": "whisper-large-v3",
 }
+
+# Traditional -> Simplified: Whisper (language="zh") often outputs Traditional
+# Chinese, and the proofreader only rewrites lines it thinks are wrong, so
+# Traditional slips through untouched. Normalize everything to Simplified at
+# the end of the pipeline. opencc-python-reimplemented is pure Python, no
+# system dependencies.
+try:
+    from opencc import OpenCC
+    _T2S = OpenCC("t2s")
+except Exception:
+    _T2S = None
+
+
+def _to_simplified(text: str) -> str:
+    """Convert Traditional Chinese to Simplified; no-op when unavailable."""
+    if _T2S is None:
+        return text
+    try:
+        return _T2S.convert(text)
+    except Exception:
+        return text
 
 app = FastAPI(title="video-to-subtitle")
 app.add_middleware(
@@ -463,6 +487,42 @@ def _only_glosses_added(original: str, new_text: str) -> bool:
     return _GLOSS_RE.sub("", new_norm) == _GLOSS_RE.sub("", norm(original))
 
 
+# Words everyone already knows -- never gloss these, even if the model does.
+# The prompt tells the model to skip them, but it still glosses some (GPU,
+# GPT, Claude, meet), so this is a code-level safety net.
+NO_GLOSS = {
+    # common tech terms
+    "gpu", "cpu", "ai", "api", "wifi", "usb", "5g", "4g", "vr", "ar",
+    "pc", "tv", "app", "os", "ios", "id", "ok", "vip", "diy",
+    # companies / products (user: these need no explanation)
+    "gpt", "claude", "gemini", "chatgpt", "meet", "google", "microsoft",
+    "apple", "openai", "anthropic", "meta", "amazon", "tesla", "nvidia",
+    "intel", "amd", "iphone", "ipad", "mac", "macbook", "windows",
+    "android", "chrome", "safari", "firefox", "edge", "zoom", "teams",
+    "slack", "discord", "telegram", "whatsapp", "wechat", "douyin",
+    "tiktok", "youtube", "instagram", "facebook", "twitter", "reddit",
+    "github", "git", "python", "java", "javascript", "html", "css",
+    "sql", "linux", "docker",
+    # units
+    "kg", "km", "cm", "mm", "ml", "gb", "mb", "tb", "hz",
+}
+_GLOSS_WORD_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)?)\s*（[^（）]*）")
+
+
+def _strip_denylisted_glosses(text: str) -> str:
+    """Remove （中文意思） after words everyone already knows.
+
+    Only the gloss is removed; the English word itself is kept.
+    """
+    def repl(m):
+        token = m.group(1)
+        base = token.lower().split("-")[0]
+        if token.lower() in NO_GLOSS or base in NO_GLOSS:
+            return token
+        return m.group(0)
+    return _GLOSS_WORD_RE.sub(repl, text)
+
+
 def annotate_segments(segments: list[dict], title: str, api_key: str) -> tuple[list[dict], int]:
     """Add （中文意思） after English words, keeping timestamps.
 
@@ -492,8 +552,15 @@ def annotate_segments(segments: list[dict], title: str, api_key: str) -> tuple[l
                 continue
             # Keep Whisper's leading space, if any, so spacing stays consistent.
             lead = original[: len(original) - len(original.lstrip())]
-            fixed[i]["text"] = lead + text.strip().replace("(", "（").replace(")", "）")
-            annotated += 1
+            glossed = _strip_denylisted_glosses(
+                text.strip().replace("(", "（").replace(")", "）")
+            )
+            new_text = lead + glossed
+            # If every gloss was on a denylisted word, the line is unchanged
+            # and doesn't count as annotated.
+            if new_text != original:
+                fixed[i]["text"] = new_text
+                annotated += 1
         if base + ANNOTATE_BATCH < len(idxs):
             time.sleep(2)
     return fixed, annotated
@@ -558,6 +625,12 @@ def do_transcribe(
                 proofread_stats["annotated"] = annotated
             except Exception:
                 pass
+        # Normalize everything to Simplified Chinese: Whisper (language="zh")
+        # often outputs Traditional, and the proofreader doesn't rewrite lines
+        # it thinks are already right, so Traditional slips through. This is
+        # the final guarantee -- it runs after proofreading and annotating.
+        for s in segments:
+            s["text"] = _to_simplified(s.get("text", ""))
         return {
             "title": title,
             "duration": round(duration, 1),
