@@ -56,6 +56,10 @@ PROOFREAD_SYSTEM = (
     "（例如“这不岂是多妙”很可能是“这步棋有多妙”）；"
     "如果某行里的型号、编号与上面列出的反复出现的型号只差一两个字母，优先按反复出现的那个修正"
     "（例如视频里 CT5 出现多次，某行出现 CP5 很可能是把 T 听成了 P）；"
+    "注意中英夹杂：说话人有时会说英文单词，转写可能把英文听成了中文同音字"
+    "（例如“畅选”其实是 chance、“来味”其实是 level）；如果某行中文读起来别扭、"
+    "又和某个英文单词发音接近、且按英文理解更符合上下文，就改成那个英文单词；"
+    "已经写对的英文单词不要改成中文，也不要改动；"
     "只返回你改动过的行，每行格式“编号. 修正后的文本”；没有改动的行不要返回；"
     "不要输出任何多余内容。"
 )
@@ -232,6 +236,12 @@ def transcribe_file(audio_path: Path, model: str, api_key: str) -> dict:
         data = {
             "model": model,
             "language": "zh",
+            # NOTE: do NOT add a `prompt` here. Tested 2026-11-17: an
+            # instructional bilingual prompt ("中文写中文，英文写英文…")
+            # makes Whisper echo the prompt itself ("中文写中文，") instead
+            # of transcribing the audio. English words misheard as Chinese
+            # ("畅选" for chance) are fixed downstream by the proofreader,
+            # which has the full context to tell them apart.
             "response_format": "verbose_json",
         }
         headers = {
