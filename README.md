@@ -7,13 +7,14 @@
 - `GET /health` → `{"ok": true}`
 - `POST /transcribe`，JSON body：
   ```json
-  {"url": "https://v.douyin.com/xxxx", "mode": "fast"}
+  {"url": "https://v.douyin.com/xxxx", "mode": "fast", "annotate": true}
   ```
   `mode` 是 `fast`（whisper-large-v3-turbo，约 20 秒）或 `accurate`（whisper-large-v3，更准）。
+  `annotate` 可选，`true` 时校对之后再给字幕里的英文单词后面加全角括号写中文意思（如 `chance（机会）`）；不传或传别的值就是关，旧版页面不受影响。
   长视频全程要 2–4 分钟，超过平台代理约 2 分钟的单次请求上限（20 分钟视频实测两次 524 超时），所以这个接口只创建一个后台任务、立刻返回 `{"job_id": "...", "status": "processing"}`（HTTP 202），再用下面的接口轮询：
 - `GET /jobs/{job_id}`，每 5 秒查一次，直到 `status` 变成 `done` 或 `error`：
   - 进行中：`{"status": "processing", "stage": "parse|download|audio|transcribe|proofread"}`（真实进度，页面按这个显示步骤）
-  - 成功：`{"status": "done", "title": "视频标题", "duration": 544.6, "transcript": "全文……", "segments": [{"start": 0.0, "end": 4.2, "text": "……"}], "proofread": {"changed": 8, "batches": 1}}`
+  - 成功：`{"status": "done", "title": "视频标题", "duration": 544.6, "transcript": "全文……", "segments": [{"start": 0.0, "end": 4.2, "text": "……"}], "proofread": {"changed": 8, "batches": 1, "annotated": 2}}`（`annotated` 只有请求里 `annotate` 为 `true` 时才有，是加了中文释义的行数）
   - 失败：`{"status": "error", "error": "一句话说明", "step": "parse|download|audio|transcribe|config|input"}`
   - 任务不存在：HTTP 404，`{"status": "error", "error": "任务不存在或已过期，请重新提交"}`
 
@@ -27,6 +28,9 @@
 4. Groq 转写：`POST https://api.groq.com/openai/v1/audio/transcriptions`，`verbose_json`（带时间戳）。**必须发浏览器 UA**，否则 Cloudflare 拦 403（error 1010）。
    mp3 超过 25 MB 时按时间切块再逐块转写，时间戳按偏移合并。
 5. 校对：转写完再调 Groq 的语言模型 `qwen/qwen3.8-27b` 按上下文修正同音字（Whisper 听音猜字，快慢两种模式在游戏黑话上都会成片错，例如“键位”听成“箭位”、“趴键”听成“啪箭”；2026-11-16 在一条和平精英视频的 16 行字幕上实测，8 处错全修好、没改错一句）。按 100 段一批、只返回改动过的行，时间戳不动；校对失败（模型挂了、返回格式不对）时直接返回原始字幕，转写本身不受影响。注意：这个模型免费档只有 8000 token/分钟，长视频的校对会分多批、遇到 429 就等一分钟再重试，20 分钟视频校对要多花 2–4 分钟，网页端的请求超时要相应放宽到 10 分钟。校对前先从全文提取反复出现的型号/编号（字母+数字，如 CT5、4S、GPT-6，出现 2 次以上）当“锚点”写进每一批的提示词：Whisper 偶尔会把某个型号听错一次（CT5 听成 CP5，T/P 都是清塞音、快了容易混），而校对一次只看 100 段，两处不在同一批就对不上；锚点让每一批都知道全视频反复出现的正确写法，单次出现的相似写法优先按锚点修正（2026-11-16 一条买车视频实测：03:28 的 CP5 漏网，04:24 的 CT5 正确，修法由此而来）。校对提示词里还有一条“查漏字”规则：转写有时会漏掉一个字、特别是重复的字（“东东”写成“东”），如果同一段里别处出现过更完整的写法就按完整的补全（2026-11-16 一条东东电竞陪玩视频实测：首段“东电竞”靠同批里“东东ID”补回了“东东电竞”）；还有一条“固定说法”规则：读起来别扭、又和某个常见固定说法发音接近的，优先按固定说法修正（2026-11-16 一条 Muse 开源硬件视频实测：00:08 的“这不岂是多妙”靠这条改回了“这步棋有多妙”）；但“右探头”这类靠成对推理的修正不太稳定，同一提示词有时修好、有时漏掉，不是每次都行。
+
+6. 英文释义（可选，请求里 `annotate: true` 才跑）：校对之后，只把含英文单词的行挑出来交给同一个模型，让它在英文词后面加（中文意思）。人名、品牌、型号编号不加。代码里有一道保险：模型返回的行去掉所有括号释义后，必须和原句一模一样才采用，模型顺手改了中文、标点或漏了字的行一律丢弃、保留原句；失败时也是原样返回。这一步沿用 `proofread` 这个阶段名，因为页面只认识 parse/download/audio/transcribe/proofread 五个阶段名，出现不认识的阶段名页面进度会跳回第 1 步。
+7. 中英夹杂的校对（2026-11-17）：Whisper 固定 `language=zh`，遇到夹在中文里的英文会写成汉字（party 写成“趴”、chance 写成“畅选”）。试过给 Whisper 加 `prompt` 提示中英混说，结果 Whisper 把提示词本身当字幕念出来，所以不加；改成在校对提示词里写明这类音译要改回英文，并专门写了“趴”要看上下文（游戏里的“趴键”不改，“参加个趴”改成 party），避免误伤。这条是靠大模型判断，不保证每次都对。
 
 Groq 的 key 只从环境变量 `GROQ_API_KEY` 读，不在代码里出现。没设 key 时 `/transcribe` 直接返回 500，提示去部署平台的环境变量里加。
 

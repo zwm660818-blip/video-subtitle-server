@@ -57,10 +57,29 @@ PROOFREAD_SYSTEM = (
     "如果某行里的型号、编号与上面列出的反复出现的型号只差一两个字母，优先按反复出现的那个修正"
     "（例如视频里 CT5 出现多次，某行出现 CP5 很可能是把 T 听成了 P）；"
     "注意中英夹杂：说话人有时会说英文单词，转写可能把英文听成了中文同音字"
-    "（例如“畅选”其实是 chance、“来味”其实是 level）；如果某行中文读起来别扭、"
-    "又和某个英文单词发音接近、且按英文理解更符合上下文，就改成那个英文单词；"
+    "（例如“畅选”其实是 chance、“来味”其实是 level）；"
+    "如果某行中文读起来别扭、又和某个英文单词发音接近、且按英文理解更符合上下文，就改成那个英文单词；"
+    "特别注意“趴”要看上下文：讲游戏操作时的“趴键”“趴下”是原意，不要改；"
+    "但“参加个趴”“开个趴”“去个趴”这种搭配里，“趴”是 party（派对、聚会）的音译，"
+    "要改成 party（例如前后在讲论坛、合影、社交场合时，“我去参加个趴”应改为“我去参加个party”）；"
     "已经写对的英文单词不要改成中文，也不要改动；"
     "只返回你改动过的行，每行格式“编号. 修正后的文本”；没有改动的行不要返回；"
+    "不要输出任何多余内容。"
+)
+# English-gloss step: runs AFTER proofreading (so misheard English like 趴 has
+# already been turned back into party) and only on lines that contain English.
+ANNOTATE_BATCH = 60  # lines per LLM call; only English-bearing lines are sent
+ANNOTATE_SYSTEM = (
+    "你是字幕编辑。用户给你一段视频字幕里的若干行（已经校对过），每行前面有编号。"
+    "你的任务：给每行里出现的英文单词或英文短语，在它后面紧跟一个全角括号，写上它在这句话里的中文意思，"
+    "例如“你去寻找自己的chance”改成“你去寻找自己的chance（机会）”，"
+    "“我去参加个party”改成“我去参加个party（派对）”。"
+    "规则：中文意思要简短（一般 2 到 6 个字），按这句话的上下文取最贴切的意思；"
+    "整个英文短语（如 face to face）作为一个整体只标一个意思，不要拆开；"
+    "人名、品牌名、型号编号、缩写、字母加数字的写法（如 CT5、iPhone、ID、GPT-6、OK）不用加释义，保持原样；"
+    "已经带有括号解释的英文词不要重复加；"
+    "除了加括号释义，不要改动这一行的任何其他字，不要改标点，不要改中文，不要润色；"
+    "只返回你加过释义的行，每行格式“编号. 加好释义的文本”；没有英文词需要加释义的行不要返回；"
     "不要输出任何多余内容。"
 )
 MAX_GROQ_BYTES = 25 * 1024 * 1024          # Groq rejects files over 25 MB
@@ -296,7 +315,12 @@ def _extract_anchors(segments: list[dict]) -> str:
 
 
 def _proofread_batch(
-    batch: list[dict], title: str, api_key: str, anchors: str = ""
+    batch: list[dict],
+    title: str,
+    api_key: str,
+    anchors: str = "",
+    system: str = PROOFREAD_SYSTEM,
+    extra_chars: int = 20,
 ) -> dict[int, str]:
     """Proofread one batch; returns {1-based index: corrected text}.
 
@@ -304,6 +328,10 @@ def _proofread_batch(
     returns {} (caller keeps the originals). Retries on 429: the free tier
     for this model allows only 8000 tokens/min, so a long video's batches
     will hit the limit -- wait out the minute window and try again.
+
+    `system` and `extra_chars` let the English-gloss step reuse this same
+    call/parse/retry logic with its own prompt and a bigger length allowance
+    (a line can legitimately grow by a few "（中文意思）" groups).
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -323,7 +351,7 @@ def _proofread_batch(
                 json={
                     "model": PROOFREAD_MODEL,
                     "messages": [
-                        {"role": "system", "content": PROOFREAD_SYSTEM},
+                        {"role": "system", "content": system},
                         {"role": "user", "content": user_msg},
                     ],
                     "temperature": 0,
@@ -366,7 +394,7 @@ def _proofread_batch(
                 continue
             original = batch[idx - 1].get("text", "")
             # Guard against a runaway "correction" that rewrites the line.
-            if len(text) > max(3 * len(original), len(original) + 20):
+            if len(text) > max(3 * len(original), len(original) + extra_chars):
                 continue
             parsed[idx] = text
         return parsed
@@ -412,7 +440,68 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
     return fixed, {"changed": changed, "batches": batches}
 
 
-def do_transcribe(url: str, mode: str, api_key: str, on_stage=None) -> dict:
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_GLOSS_RE = re.compile(r"（[^（）]*）")
+
+
+def _only_glosses_added(original: str, new_text: str) -> bool:
+    """True if new_text equals original once the （…） glosses are removed.
+
+    This is the safety net for the gloss step: the model may only INSERT
+    parenthesised meanings. If it also rewrote the Chinese, fixed the
+    punctuation or dropped words, the line is rejected and the original is
+    kept. ASCII parentheses are normalised first, and whitespace is ignored
+    (Whisper segments often start with a space).
+    """
+    def norm(s: str) -> str:
+        s = s.replace("(", "（").replace(")", "）")
+        return re.sub(r"\s+", "", s)
+
+    new_norm = norm(new_text)
+    if "（" not in new_norm:
+        return False
+    return _GLOSS_RE.sub("", new_norm) == _GLOSS_RE.sub("", norm(original))
+
+
+def annotate_segments(segments: list[dict], title: str, api_key: str) -> tuple[list[dict], int]:
+    """Add （中文意思） after English words, keeping timestamps.
+
+    Only lines that contain an English word are sent to the LLM, so this
+    costs few tokens (usually a handful of lines). Never raises: on any
+    failure the segments come back unchanged. Returns (segments, count of
+    lines that got glosses).
+    """
+    fixed = [dict(s) for s in segments]
+    idxs = [i for i, s in enumerate(fixed) if _ENGLISH_WORD_RE.search(s.get("text", ""))]
+    if not idxs:
+        return fixed, 0
+    annotated = 0
+    for base in range(0, len(idxs), ANNOTATE_BATCH):
+        sub_idx = idxs[base:base + ANNOTATE_BATCH]
+        sub = [fixed[i] for i in sub_idx]
+        try:
+            parsed = _proofread_batch(
+                sub, title, api_key, system=ANNOTATE_SYSTEM, extra_chars=60
+            )
+        except Exception:
+            parsed = {}
+        for k, text in parsed.items():
+            i = sub_idx[k - 1]
+            original = fixed[i].get("text", "")
+            if not _only_glosses_added(original, text):
+                continue
+            # Keep Whisper's leading space, if any, so spacing stays consistent.
+            lead = original[: len(original) - len(original.lstrip())]
+            fixed[i]["text"] = lead + text.strip().replace("(", "（").replace(")", "）")
+            annotated += 1
+        if base + ANNOTATE_BATCH < len(idxs):
+            time.sleep(2)
+    return fixed, annotated
+
+
+def do_transcribe(
+    url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False
+) -> dict:
     """Run the whole pipeline in a worker thread. Returns the response dict.
 
     on_stage, when given, is called with the current stage name so a caller
@@ -458,6 +547,17 @@ def do_transcribe(url: str, mode: str, api_key: str, on_stage=None) -> dict:
             segments, proofread_stats = proofread_segments(segments, title, api_key)
         except Exception:
             pass
+        # Optional: put （中文意思） after English words. Runs after proofreading
+        # so misheard English has already been restored. It reuses the
+        # "proofread" stage name on purpose: the page only knows the stages
+        # parse/download/audio/transcribe/proofread, and an unknown name would
+        # make its progress steps jump back to step 1.
+        if annotate:
+            try:
+                segments, annotated = annotate_segments(segments, title, api_key)
+                proofread_stats["annotated"] = annotated
+            except Exception:
+                pass
         return {
             "title": title,
             "duration": round(duration, 1),
@@ -480,7 +580,7 @@ jobs_lock = threading.Lock()
 JOB_TTL_SECONDS = 3600
 
 
-def _run_job(job_id: str, url: str, mode: str, api_key: str) -> None:
+def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = False) -> None:
     """Background worker: run the pipeline and store the outcome."""
     def on_stage(name: str):
         with jobs_lock:
@@ -489,7 +589,7 @@ def _run_job(job_id: str, url: str, mode: str, api_key: str) -> None:
                 job["stage"] = name
 
     try:
-        result = do_transcribe(url, mode, api_key, on_stage=on_stage)
+        result = do_transcribe(url, mode, api_key, on_stage=on_stage, annotate=annotate)
         with jobs_lock:
             jobs[job_id] = {"status": "done", "stage": "done", **result}
     except PipelineError as exc:
@@ -547,6 +647,9 @@ async def transcribe(request: Request):
         )
     if mode not in MODELS:
         mode = "fast"
+    # Optional switch from the page: add （中文意思） after English words.
+    # Absent or anything else means off, so older pages behave as before.
+    annotate = body.get("annotate") in (True, 1, "1", "true", "True")
 
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -567,7 +670,7 @@ async def transcribe(request: Request):
             "created_at": time.time(),
         }
     thread = threading.Thread(
-        target=_run_job, args=(job_id, url, mode, api_key), daemon=True
+        target=_run_job, args=(job_id, url, mode, api_key, annotate), daemon=True
     )
     thread.start()
     return JSONResponse(

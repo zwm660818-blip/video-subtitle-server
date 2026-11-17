@@ -129,6 +129,7 @@
     <div style="height:6px"></div>
     <div class="a-row"><span>自动加标点</span><button class="switch on" id="punct-switch" onclick="this.classList.toggle('on')" aria-label="自动加标点开关"></button></div>
     <div class="a-row"><span>转完顺手总结</span><button class="switch" id="summary-switch" onclick="this.classList.toggle('on')" aria-label="转完总结开关"></button></div>
+    <div class="a-row"><span>英文词加中文释义</span><button class="switch on" id="annotate-switch" onclick="toggleAnnotate()" aria-label="英文词加中文释义开关"></button></div>
   </div>
 
   <button class="a-cta" id="cta" onclick="runTranscribe()">开始转字幕</button>
@@ -184,12 +185,25 @@ var LS_TS = 'vts.showTimestamps';
 var LS_RESULT = 'vts.lastResult';
 var LS_JOB = 'vts.pendingJob';
 var LS_HISTORY = 'vts.history';
+var LS_ANNOTATE = 'vts.annotateEnglish';
 var HISTORY_MAX = 20;
 var showTimestamps = true;
+var annotateEnglish = true;   /* 英文词后面加（中文意思），默认开 */
 function storeGet(k){ try { return window.localStorage.getItem(k); } catch(e) { return null; } }
 function storeSet(k, v){ try { window.localStorage.setItem(k, v); } catch(e) {} }
 function storeRemove(k){ try { window.localStorage.removeItem(k); } catch(e) {} }
 if(storeGet(LS_TS) === '0') showTimestamps = false;
+if(storeGet(LS_ANNOTATE) === '0') annotateEnglish = false;
+
+function applyAnnotateSwitch(){
+  var sw = document.getElementById('annotate-switch');
+  if(sw) sw.classList.toggle('on', annotateEnglish);
+}
+function toggleAnnotate(){
+  annotateEnglish = !annotateEnglish;
+  storeSet(LS_ANNOTATE, annotateEnglish ? '1' : '0');
+  applyAnnotateSwitch();
+}
 
 function applyTsSwitch(){
   var sw = document.getElementById('ts-switch');
@@ -469,7 +483,7 @@ function postJob(url){
   return fetch(API_BASE + '/transcribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: url, mode: currentMode })
+    body: JSON.stringify({ url: url, mode: currentMode, annotate: annotateEnglish })
   }).then(function(res){
     return res.text().then(function(text){
       var data = null;
@@ -653,9 +667,13 @@ function renderResult(data, url, opts){
 
   /* 校对改了几行：后端给了才显示，没给就不显示 */
   var note = document.getElementById('proofread-note');
-  var changed = (data.proofread && typeof data.proofread.changed === 'number') ? data.proofread.changed : null;
-  if(changed !== null && changed > 0){
-    note.textContent = '校对改了 ' + changed + ' 处';
+  var changed = (data.proofread && typeof data.proofread.changed === 'number') ? data.proofread.changed : 0;
+  var annotated = (data.proofread && typeof data.proofread.annotated === 'number') ? data.proofread.annotated : 0;
+  var noteParts = [];
+  if(changed > 0) noteParts.push('校对改了 ' + changed + ' 处');
+  if(annotated > 0) noteParts.push('给 ' + annotated + ' 行英文加了中文释义');
+  if(noteParts.length){
+    note.textContent = noteParts.join('，');
     note.classList.add('show');
   } else {
     note.textContent = '';
@@ -787,6 +805,7 @@ async function resumeJob(job){
 }
 function restoreOnLoad(){
   applyTsSwitch();
+  applyAnnotateSwitch();
   /* 历史迁移：本地已经存着的上次结果，作为历史里的第一条 */
   var lastSaved = null;
   try { lastSaved = JSON.parse(storeGet(LS_RESULT) || 'null'); } catch(e) {}
