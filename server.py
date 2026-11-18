@@ -616,6 +616,52 @@ def annotate_segments(segments: list[dict], title: str, api_key: str) -> tuple[l
     return fixed, annotated
 
 
+_SENTENCE_END = set(".!?。！？…")
+_TRAILING_QUOTE = "\"”’）】})]"
+
+
+def merge_segments(segments: list[dict], max_chars: int = 220, max_gap: float = 3.0) -> list[dict]:
+    """Merge Whisper segments that are continuations of the same sentence.
+
+    Whisper splits at pauses, so a sentence like "over a trillion dollars"
+    can land as "...over a trillion" in one segment and "dollars ..." in the
+    next -- the sentence reads as broken, and translating segment by segment
+    keeps the break (the reader hits "超过一万亿" at 06:04 and only meets
+    "美元" at 06:09). Merge a segment into the previous one when the
+    previous does not end with sentence-ending punctuation, the gap is
+    short, and the merged text stays readable. The merged segment keeps the
+    first segment's start and the last one's end. Fewer, coherent segments
+    also mean fewer tokens, so /translate is faster and less likely to hit
+    the Groq rate limit.
+    """
+    if not segments:
+        return segments
+    merged: list[dict] = [dict(segments[0])]
+    for seg in segments[1:]:
+        prev = merged[-1]
+        prev_text = (prev.get("text") or "").strip()
+        cur_text = (seg.get("text") or "").strip()
+        if not cur_text:
+            continue
+        if not prev_text:
+            prev.update(seg)
+            continue
+        stripped = prev_text.rstrip(_TRAILING_QUOTE)
+        last_char = stripped[-1] if stripped else ""
+        gap = float(seg.get("start", 0)) - float(prev.get("end", 0))
+        # Join with a space unless both sides are CJK (Chinese needs none).
+        joiner = "" if ('\u4e00' <= last_char <= '\u9fff' and '\u4e00' <= cur_text[0] <= '\u9fff') else " "
+        combined = prev_text + joiner + cur_text
+        if (last_char not in _SENTENCE_END
+                and gap <= max_gap
+                and len(combined) <= max_chars):
+            prev["text"] = combined
+            prev["end"] = seg.get("end", prev.get("end"))
+        else:
+            merged.append(dict(seg))
+    return merged
+
+
 def do_transcribe(
     url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False
 ) -> dict:
@@ -661,6 +707,10 @@ def do_transcribe(
                     "end": round(float(seg.get("end", 0)) + offset, 2),
                     "text": seg.get("text", ""),
                 })
+        # Merge Whisper's pause-splits back into whole sentences before
+        # proofreading and translation, so a sentence is never cut in half
+        # across two segments (e.g. "over a trillion" / "dollars").
+        segments = merge_segments(segments)
         # The Chinese proofreader, the English-gloss annotator and the
         # Traditional->Simplified pass all assume a Chinese transcript.
         # On a non-Chinese video (e.g. an English documentary) they would
