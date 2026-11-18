@@ -263,27 +263,42 @@ def parse_link(url: str) -> tuple[str, str]:
 
 
 def download_video(video_url: str, dest: Path) -> None:
-    """Step 2: download the video file."""
+    """Step 2: download the video file. Retries up to 3 times, resuming with
+    HTTP Range from where the last attempt stopped: a dropped connection on
+    a large file (e.g. Bilibili ~245 MB, peer closed at 82%) picks up the
+    remaining bytes instead of starting over."""
     headers = {"User-Agent": CHROME_UA}
     if "douyin" in video_url:
         headers["Referer"] = DOUYIN_REFERER
-    try:
-        with httpx.stream(
-            "GET",
-            video_url,
-            headers=headers,
-            timeout=httpx.Timeout(600.0, connect=10.0),
-            follow_redirects=True,
-        ) as resp:
-            if resp.status_code != 200:
-                raise PipelineError("download", f"视频下载失败，HTTP {resp.status_code}")
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_bytes(1024 * 256):
-                    f.write(chunk)
-    except httpx.RequestError as exc:
-        raise PipelineError("download", f"视频下载失败: {exc}")
-    if dest.stat().st_size == 0:
-        raise PipelineError("download", "视频下载下来是空文件")
+    last_exc: Exception | None = None
+    for _attempt in range(3):
+        downloaded = dest.stat().st_size if dest.exists() else 0
+        req_headers = dict(headers)
+        if downloaded > 0:
+            req_headers["Range"] = f"bytes={downloaded}-"
+        try:
+            with httpx.stream(
+                "GET",
+                video_url,
+                headers=req_headers,
+                timeout=httpx.Timeout(600.0, connect=10.0),
+                follow_redirects=True,
+            ) as resp:
+                if resp.status_code not in (200, 206):
+                    raise PipelineError("download", f"视频下载失败，HTTP {resp.status_code}")
+                # Server ignored Range and answered 200: restart from scratch.
+                mode = "ab" if (resp.status_code == 206 and downloaded > 0) else "wb"
+                with open(dest, mode) as f:
+                    for chunk in resp.iter_bytes(1024 * 256):
+                        f.write(chunk)
+        except httpx.RequestError as exc:
+            last_exc = exc
+            time.sleep(2)
+            continue
+        if dest.stat().st_size == 0:
+            raise PipelineError("download", "视频下载下来是空文件")
+        return
+    raise PipelineError("download", f"视频下载失败: {last_exc}")
 
 
 def probe_duration(video_path: Path) -> float:
