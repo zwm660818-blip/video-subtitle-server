@@ -685,12 +685,19 @@ function renderResult(data, url, opts){
   /* 兜底：从历史/上次结果恢复的旧数据也先清理一遍再显示，保证复制和下载同样干净 */
   cleanResultData(data);
   lastResult = data;
-  /* 恢复翻译状态：本地存的记录若带原文，说明上次停在译文 */
-  if(Array.isArray(data._origSegments) && data._origSegments.length){
+  /* 恢复翻译状态：本地存的记录若带原文+译文，说明翻过；
+     当前显示的是哪边，就按 segments 里的内容判断 */
+  var hasOrig = Array.isArray(data._origSegments) && data._origSegments.length;
+  var hasTrans = Array.isArray(data._translatedSegments) && data._translatedSegments.length;
+  if(hasOrig && hasTrans){
     originalSegments = data._origSegments;
-    showingTranslation = true;
+    translatedSegments = data._translatedSegments;
+    /* 当前显示的是译文还是原文：看第一段和译文第一段是否一致 */
+    showingTranslation = (data.segments && data.segments.length && data.segments[0]
+      && translatedSegments[0] && data.segments[0].text === translatedSegments[0].text);
   } else {
     originalSegments = null;
+    translatedSegments = null;
     showingTranslation = false;
   }
   var segments = Array.isArray(data.segments) ? data.segments : [];
@@ -807,9 +814,11 @@ function showSummary(){
 /* ---------- 翻译成中文：只有英文结果才显示按钮；正文内容优先判断 ----------
    按钮逻辑：英文结果显示“翻译成中文”；点后先试一次后端 /translate，通了用它，
    不通改走页面直连（Google gtx 批量 → MyMemory 批量，整批对不齐逐段补翻），
-   时间点不变；翻译后按钮变成“查看原文”，再点切回英文原文。 */
+   时间点不变；翻译后按钮变成“查看原文”，再点切回英文原文。
+   原文和译文都缓存下来，原文↔中文来回切只是换显示，不用重新翻译。 */
 var showingTranslation = false;
-var originalSegments = null;  /* 翻译前保存的英文原文段 */
+var originalSegments = null;  /* 英文原文段 */
+var translatedSegments = null;  /* 中文译文段：翻过一次就缓存，切回来不用重翻 */
 function isEnglishResult(data){
   var text = '';
   if(data){
@@ -839,6 +848,12 @@ function updateTranslateBtn(){
   if(showingTranslation){
     btn.style.display = '';
     btn.textContent = '查看原文';
+    return;
+  }
+  /* 已翻过：按钮是“查看中文”，点一下直接换显示，不用重新翻译 */
+  if(translatedSegments && translatedSegments.length){
+    btn.style.display = '';
+    btn.textContent = '查看中文';
     return;
   }
   if(lastResult && isEnglishResult(lastResult)){
@@ -904,15 +919,23 @@ function translateTextsClientSide(texts){
 async function toggleTranslate(){
   if(!lastResult){ toast('还没有转写结果'); return; }
   var btn = document.getElementById('translate-btn');
-  /* 正在看译文：切回原文 */
+  /* 正在看译文：切回原文。译文缓存留着，再切回中文不用重翻 */
   if(showingTranslation){
     if(originalSegments){
       lastResult.segments = originalSegments;
       lastResult.transcript = originalSegments.map(function(s){ return s.text || ''; }).join('\n');
-      originalSegments = null;
     }
-    delete lastResult._origSegments;
     showingTranslation = false;
+    renderLines(lastResult);
+    updateTranslateBtn();
+    try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
+    return;
+  }
+  /* 已经翻过：直接换上缓存的译文，不用重新翻译 */
+  if(translatedSegments && translatedSegments.length){
+    lastResult.segments = translatedSegments;
+    lastResult.transcript = translatedSegments.map(function(s){ return s.text || ''; }).join('\n');
+    showingTranslation = true;
     renderLines(lastResult);
     updateTranslateBtn();
     try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
@@ -947,13 +970,16 @@ async function toggleTranslate(){
     updateTranslateBtn();
     return;
   }
-  /* 保存原文，换上译文（时间点不变），原文也存进记录、刷新后还能切回 */
+  /* 原文和译文都存下来：原文存 _origSegments，译文存 _translatedSegments，
+     刷新后也能切回，原文↔中文来回切都不用重新翻译 */
   originalSegments = segs.map(function(s){ return { start: s.start, end: s.end, text: s.text }; });
-  lastResult._origSegments = originalSegments;
-  lastResult.segments = segs.map(function(s, i){
+  translatedSegments = segs.map(function(s, i){
     return { start: s.start, end: s.end, text: translated[i] || s.text };
   });
-  lastResult.transcript = lastResult.segments.map(function(s){ return s.text; }).join('\n');
+  lastResult._origSegments = originalSegments;
+  lastResult._translatedSegments = translatedSegments;
+  lastResult.segments = translatedSegments;
+  lastResult.transcript = translatedSegments.map(function(s){ return s.text; }).join('\n');
   showingTranslation = true;
   renderLines(lastResult);
   updateTranslateBtn();
