@@ -111,7 +111,6 @@ ANNOTATE_SYSTEM = (
     "不要输出任何多余内容。"
 )
 MAX_GROQ_BYTES = 25 * 1024 * 1024          # Groq rejects files over 25 MB
-CHUNK_TARGET_BYTES = 24 * 1024 * 1024      # stay safely under the limit
 DOUYIN_REFERER = "https://www.douyin.com/"
 
 MODELS = {
@@ -263,13 +262,38 @@ def parse_link(url: str) -> tuple[str, str]:
 
 
 def download_video(video_url: str, dest: Path) -> None:
-    """Step 2: download the video file. Retries up to 3 times, resuming with
-    HTTP Range from where the last attempt stopped: a dropped connection on
-    a large file (e.g. Bilibili ~245 MB, peer closed at 82%) picks up the
-    remaining bytes instead of starting over."""
+    """Step 2: download the video file. For files over 20 MB, fetch 4 byte
+    ranges in parallel (several CDNs serve one connection slowly but allow
+    concurrent ranges); small files and servers without Range support fall
+    back to a single stream. Retries up to 3 times, resuming with HTTP Range
+    from where the last attempt stopped: a dropped connection on a large
+    file (e.g. Bilibili ~245 MB, peer closed at 82%) picks up the remaining
+    bytes instead of starting over."""
     headers = {"User-Agent": CHROME_UA}
     if "douyin" in video_url:
         headers["Referer"] = DOUYIN_REFERER
+    # Find the total size with a 1-byte Range probe; fall back to single
+    # stream if the server won't tell us (or won't do ranges).
+    total = 0
+    try:
+        with httpx.stream(
+            "GET", video_url,
+            headers={**headers, "Range": "bytes=0-0"},
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+        ) as resp:
+            if resp.status_code == 206:
+                cr = resp.headers.get("Content-Range", "")
+                total = int(cr.split("/")[-1]) if "/" in cr else 0
+    except httpx.RequestError:
+        total = 0
+    if total > 20 * 1024 * 1024:
+        try:
+            _download_parallel(video_url, dest, total, headers)
+            if dest.stat().st_size == total:
+                return
+        except Exception:
+            pass  # fall through to the single-stream path
     last_exc: Exception | None = None
     for _attempt in range(3):
         downloaded = dest.stat().st_size if dest.exists() else 0
@@ -301,6 +325,38 @@ def download_video(video_url: str, dest: Path) -> None:
     raise PipelineError("download", f"视频下载失败: {last_exc}")
 
 
+def _download_parallel(video_url: str, dest: Path, total: int, headers: dict) -> None:
+    """Download a file in 4 concurrent Range chunks, then concatenate."""
+    import concurrent.futures
+
+    parts = 4
+    chunk_size = (total + parts - 1) // parts
+    part_paths = [dest.with_suffix(f".part{i}") for i in range(parts)]
+
+    def fetch(i: int) -> None:
+        start = i * chunk_size
+        end = min(total - 1, start + chunk_size - 1)
+        with httpx.stream(
+            "GET", video_url,
+            headers={**headers, "Range": f"bytes={start}-{end}"},
+            timeout=httpx.Timeout(600.0, connect=10.0),
+            follow_redirects=True,
+        ) as resp:
+            if resp.status_code != 206:
+                raise PipelineError("download", f"并行下载失败，HTTP {resp.status_code}")
+            with open(part_paths[i], "wb") as f:
+                for chunk in resp.iter_bytes(1024 * 256):
+                    f.write(chunk)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parts) as pool:
+        list(pool.map(fetch, range(parts)))
+    with open(dest, "wb") as out:
+        for p in part_paths:
+            with open(p, "rb") as f:
+                out.write(f.read())
+            p.unlink()
+
+
 def probe_duration(video_path: Path) -> float:
     """ffprobe: video duration in seconds."""
     out = _run(
@@ -319,8 +375,27 @@ def probe_duration(video_path: Path) -> float:
         raise PipelineError("audio", "读取视频时长失败")
 
 
-def extract_audio(video_path: Path, mp3_path: Path) -> None:
-    """Step 3: ffmpeg -> 128k mp3 (about 1 MB per minute)."""
+def extract_audio(video_path: Path, tmpdir: Path) -> Path:
+    """Step 3: get the audio track. First try a stream copy (no re-encode,
+    nearly instant when the video's audio is already AAC); fall back to
+    re-encoding to 128k MP3. Returns the audio file path (may be .m4a)."""
+    m4a_path = tmpdir / "audio.m4a"
+    try:
+        _run(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-i", str(video_path),
+                "-vn", "-c:a", "copy",
+                str(m4a_path),
+            ],
+            "audio",
+            "提取音频",
+        )
+        if m4a_path.stat().st_size > 0:
+            return m4a_path
+    except (PipelineError, OSError):
+        pass
+    mp3_path = tmpdir / "audio.mp3"
     _run(
         [
             "ffmpeg", "-y", "-v", "error",
@@ -333,6 +408,7 @@ def extract_audio(video_path: Path, mp3_path: Path) -> None:
     )
     if mp3_path.stat().st_size == 0:
         raise PipelineError("audio", "提取出来的音频是空的")
+    return mp3_path
 
 
 def split_audio(mp3_path: Path, duration: float, tmpdir: Path) -> list[tuple[Path, float]]:
@@ -343,8 +419,11 @@ def split_audio(mp3_path: Path, duration: float, tmpdir: Path) -> list[tuple[Pat
     size = mp3_path.stat().st_size
     if size <= MAX_GROQ_BYTES:
         return [(mp3_path, 0.0)]
-    # chunk length so each chunk stays under the target size
-    chunk_seconds = max(60, int(duration * CHUNK_TARGET_BYTES / size))
+    # Chunks are re-encoded to 128k MP3 (~16 KB/s), so size them by the
+    # OUTPUT bitrate, not the input file size: an .m4a input (AAC, smaller
+    # per minute) would otherwise make chunks that exceed Groq's 25 MB
+    # limit after re-encoding. 23 MB target leaves a safety margin.
+    chunk_seconds = max(60, (23 * 1024 * 1024) // 16000)
     chunks: list[tuple[Path, float]] = []
     start = 0.0
     index = 0
@@ -774,9 +853,8 @@ def do_transcribe(
         download_video(video_url, video_path)
         stage("audio")
         duration = probe_duration(video_path)
-        mp3_path = tmpdir / "audio.mp3"
-        extract_audio(video_path, mp3_path)
-        chunks = split_audio(mp3_path, duration, tmpdir)
+        audio_path = extract_audio(video_path, tmpdir)
+        chunks = split_audio(audio_path, duration, tmpdir)
 
         stage("transcribe")
         segments: list[dict] = []
