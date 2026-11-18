@@ -474,7 +474,10 @@ function plainError(data, httpStatus){
   var step = (data && data.step) ? String(data.step) : '';
   var low = (raw + ' ' + step).toLowerCase();
   var plain = '';
-  if(low.indexOf('groq') >= 0 && (low.indexOf('key') >= 0 || low.indexOf('401') >= 0 || low.indexOf('unauthorized') >= 0)){
+  if(step === 'download' && /连不上|unreachable|errno|timed out|超时|域名解析/i.test(raw)){
+    /* 服务器自己连不上视频的下载地址（后端已经把解析到的所有地址都试过了），不是视频的问题，也不是额度问题 */
+    plain = '服务器这边连不上这个视频的下载地址，不是你的链接有问题。服务器已经自动换着试了几个地址，过一两分钟再点一次开始通常就好。';
+  } else if(low.indexOf('groq') >= 0 && (low.indexOf('key') >= 0 || low.indexOf('401') >= 0 || low.indexOf('unauthorized') >= 0)){
     plain = '转写服务的钥匙（Groq key）不对或者没配好，所以转不了。去 SnapDeploy 的环境变量里检查一下 GROQ_API_KEY 填得对不对。';
   } else if(low.indexOf('429') >= 0 || low.indexOf('rate') >= 0 || low.indexOf('quota') >= 0 || low.indexOf('limit') >= 0){
     plain = '转写服务今天用得太多了，额度到上限了。等一会儿，或者等额度恢复了再试。';

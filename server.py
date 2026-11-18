@@ -15,6 +15,7 @@ No secret is stored in this code.
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -22,6 +23,7 @@ import time
 import uuid
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -32,6 +34,10 @@ CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+# Failing to even open the connection (Errno 101 Network is unreachable,
+# refused, connect timeout). Retrying the same host never helps, so the
+# downloader gives up on that address at once and moves to the next one.
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
 ZACAO_URL = "https://video.zacao.top/api/parse/v2"
 HK0_BASE = "https://api.hk0.cc/api"
 # hk0.cc fallback parser (no key needed). zacao's WeChat parser broke on
@@ -339,6 +345,11 @@ def download_video(video_url: str, dest: Path) -> None:
             if resp.status_code == 206:
                 cr = resp.headers.get("Content-Range", "")
                 total = int(cr.split("/")[-1]) if "/" in cr else 0
+    except _CONNECT_ERRORS as exc:
+        # Can't open a connection at all: don't fall into the 3-retry loop
+        # below (it would hit the same wall three times, ~10 s each for a
+        # timeout). Let the caller move on to the next candidate address.
+        raise PipelineError("download", f"连不上: {exc}")
     except httpx.RequestError:
         total = 0
     if total > 20 * 1024 * 1024:
@@ -369,6 +380,15 @@ def download_video(video_url: str, dest: Path) -> None:
                 with open(dest, mode) as f:
                     for chunk in resp.iter_bytes(1024 * 256):
                         f.write(chunk)
+        except _CONNECT_ERRORS as exc:
+            if downloaded == 0:
+                # Never got a connection: same fail-fast rule as the probe.
+                raise PipelineError("download", f"连不上: {exc}")
+            # A resume after a mid-stream drop could not reconnect: that is
+            # a flaky host rather than an unreachable one, so keep trying.
+            last_exc = exc
+            time.sleep(2)
+            continue
         except httpx.RequestError as exc:
             last_exc = exc
             time.sleep(2)
@@ -376,7 +396,7 @@ def download_video(video_url: str, dest: Path) -> None:
         if dest.stat().st_size == 0:
             raise PipelineError("download", "视频下载下来是空文件")
         return
-    raise PipelineError("download", f"视频下载失败: {last_exc}")
+    raise PipelineError("download", f"下载中断，重试3次仍失败: {last_exc}")
 
 
 def download_video_any(candidates: list[str], dest: Path) -> str:
@@ -387,7 +407,7 @@ def download_video_any(candidates: list[str], dest: Path) -> str:
     .part* chunks are deleted first, because download_video resumes from
     the existing file size -- resuming a different video's bytes would
     corrupt the file. Returns the URL that worked."""
-    last_error = "没有可用的下载地址"
+    failures: list[str] = []
     for video_url in candidates:
         for suffix in ("", ".part0", ".part1", ".part2", ".part3"):
             try:
@@ -397,18 +417,65 @@ def download_video_any(candidates: list[str], dest: Path) -> str:
         try:
             download_video(video_url, dest)
         except PipelineError as exc:
-            last_error = exc.message
-            continue
+            reason = exc.message
         except Exception as exc:  # pragma: no cover - safety net
-            last_error = str(exc)
-            continue
-        if dest.exists() and dest.stat().st_size > 0:
-            return video_url
-        last_error = "视频下载下来是空文件"
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            if dest.exists() and dest.stat().st_size > 0:
+                print(f"[download] ok {_describe_host(video_url)}", flush=True)
+                return video_url
+            reason = "视频下载下来是空文件"
+        # Record WHICH host failed and what addresses it resolves to: when a
+        # job fails, this is the only clue to why (e.g. an IPv6-only CDN host
+        # gives Errno 101 on a server with no IPv6 route).
+        failures.append(f"{_describe_host(video_url)} {reason}")
+        print(f"[download] fail {failures[-1]}", flush=True)
+    if not failures:
+        raise PipelineError("download", "没有可用的下载地址")
     raise PipelineError(
         "download",
-        f"视频下载失败，试了{len(candidates)}个地址都连不上（{last_error}），请过一会儿再试",
+        f"视频下载失败，试了{len(candidates)}个地址都不行，请过一会儿再试。详情：" + "；".join(failures[:4]),
     )
+
+
+def _describe_host(video_url: str) -> str:
+    """Short 'host（IPv4×n，IPv6×m）' label for logs and error messages.
+
+    Never raises and never blocks long: it only runs on the failure path."""
+    try:
+        host = urlsplit(video_url).hostname or video_url[:40]
+    except ValueError:
+        return video_url[:40]
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return f"{host}（域名解析失败）"
+    v4 = len({i[4][0] for i in infos if i[0] == socket.AF_INET})
+    v6 = len({i[4][0] for i in infos if i[0] == socket.AF_INET6})
+    return f"{host}（IPv4×{v4}，IPv6×{v6}）"
+
+
+def download_with_reparse(url: str, candidates: list[str], dest: Path) -> str:
+    """Download from the candidates; if every one fails, parse the link again
+    and try the fresh addresses once more.
+
+    The CDN hosts and signed URLs change with every parse (e.g.
+    v11/v13-default.365yg.com), so a second parse often yields an address
+    that works, and it also gives a transient failure a second chance."""
+    try:
+        return download_video_any(candidates, dest)
+    except PipelineError as first:
+        try:
+            _title, fresh = parse_candidates(url)
+        except PipelineError:
+            raise first
+        # Addresses we have not tried come first, then re-tries of the old
+        # ones from the new parse (their signed URLs differ).
+        retry = [u for u in fresh if u not in candidates] + [u for u in fresh if u in candidates]
+        if not retry:
+            raise first
+        time.sleep(3)
+        return download_video_any(retry, dest)
 
 
 def _download_parallel(video_url: str, dest: Path, total: int, headers: dict) -> None:
@@ -981,20 +1048,9 @@ def do_transcribe(
         title, candidates = parse_candidates(url)
         stage("download")
         video_path = tmpdir / "video.mp4"
-        try:
-            download_video_any(candidates, video_path)
-        except PipelineError:
-            # All candidates failed: re-parse once for fresh signed URLs
-            # (CDN hosts rotate per parse, e.g. v11/v13-default.365yg.com)
-            # and try any addresses we have not tried yet.
-            try:
-                _title, fresh = parse_candidates(url)
-                new_candidates = [u for u in fresh if u not in candidates]
-            except PipelineError:
-                new_candidates = []
-            if not new_candidates:
-                raise
-            download_video_any(new_candidates, video_path)
+        # Tries every candidate address; if all fail, re-parses the link for
+        # fresh addresses and tries those too.
+        download_with_reparse(url, candidates, video_path)
         stage("audio")
         duration = probe_duration(video_path)
         audio_path = extract_audio(video_path, tmpdir)
