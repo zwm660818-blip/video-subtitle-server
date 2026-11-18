@@ -169,8 +169,8 @@ def _run(cmd: list[str], step: str, what: str) -> str:
 
 # ---------------------------------------------------------------- pipeline
 
-def _parse_via_zacao(url: str) -> tuple[str, str] | None:
-    """Try zacao. Returns (video_url, title) or None on any failure."""
+def _parse_via_zacao(url: str) -> tuple[str, str, list[str], bool] | None:
+    """Try zacao. Returns (video_url, title, backup_urls, is_huge) or None."""
     try:
         resp = httpx.get(
             ZACAO_URL,
@@ -197,17 +197,25 @@ def _parse_via_zacao(url: str) -> tuple[str, str] | None:
     )
     if not video_url:
         return None
+    # The other URL field, when different, is a second address for the
+    # same video (different CDN host) -- a free fallback if the first
+    # host is unreachable from the server (Errno 101, seen 2026-11-18).
+    backups = []
+    for key in ("video_url", "sourceURL", "source_video_url"):
+        alt = data.get(key)
+        if alt and alt != video_url and alt not in backups:
+            backups.append(alt)
     title = (
         data.get("title")
         or data.get("desc")
         or data.get("aweme_desc")
         or "未命名视频"
     )
-    return video_url, str(title)
+    return video_url, str(title), backups, False
 
 
-def _parse_via_hk0(url: str) -> tuple[str, str] | None:
-    """Try hk0.cc (no key). Returns (video_url, title) or None on any failure."""
+def _parse_via_hk0(url: str) -> tuple[str, str, list[str], bool] | None:
+    """Try hk0.cc (no key). Returns (video_url, title, backups, is_huge)."""
     endpoint = None
     for host, ep in HK0_ENDPOINTS:
         if host in url:
@@ -238,18 +246,42 @@ def _parse_via_hk0(url: str) -> tuple[str, str] | None:
     if not video_url:
         return None
     title = data.get("title") or data.get("desc") or "未命名视频"
-    return video_url, str(title)
+    # hk0 returns video_backup: same video on other CDN hosts. Its primary
+    # URL is sometimes the huge original (e.g. Douyin 751 MB for a 7-min
+    # video); the backups are usually the compressed ~60 MB version, so a
+    # huge primary goes last in the candidate order.
+    backups = []
+    for item in data.get("video_backup") or []:
+        if isinstance(item, str) and item and item != video_url and item not in backups:
+            backups.append(item)
+    for key in ("video_url",):
+        alt = data.get(key)
+        if alt and alt != video_url and alt not in backups:
+            backups.append(alt)
+    try:
+        size = int(data.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    is_huge = size > 200 * 1024 * 1024
+    return video_url, str(title), backups, is_huge
 
 
-def parse_link(url: str) -> tuple[str, str]:
-    """Step 1: resolve the short link to a direct video URL.
-    zacao first; hk0.cc fallback. WeChat goes hk0.cc first because zacao's
-    WeChat parser returns 401 since 2026-11-18."""
+def parse_candidates(url: str) -> tuple[str, list[str]]:
+    """Step 1: resolve the short link to ALL direct video URLs we can get.
+
+    Runs both parsers (zacao first, hk0.cc second; WeChat reversed) and
+    collects every candidate address, deduplicated, best first. Previously
+    only the first parser's single URL was kept, so when that one CDN host
+    was unreachable from the server (Errno 101 Network is unreachable,
+    2026-11-18 18:26 on a Douyin link) the whole job failed even though
+    the other parser had a working address for the same video.
+    Returns (title, [url, ...])."""
     is_wechat = "weixin.qq.com" in url or "channels.weixin.qq.com" in url
     attempts = (
         [_parse_via_hk0, _parse_via_zacao] if is_wechat
         else [_parse_via_zacao, _parse_via_hk0]
     )
+    results = []
     for fn in attempts:
         try:
             result = fn(url)
@@ -257,8 +289,27 @@ def parse_link(url: str) -> tuple[str, str]:
             # A parser must never crash the job; try the next one.
             continue
         if result:
-            return result
-    raise PipelineError("parse", "这个链接解析不出来，换个链接试试")
+            results.append(result)
+    if not results:
+        raise PipelineError("parse", "这个链接解析不出来，换个链接试试")
+    title = results[0][1]
+    primaries: list[str] = []
+    huge_primaries: list[str] = []
+    backups: list[str] = []
+    for video_url, _t, backup_urls, is_huge in results:
+        (huge_primaries if is_huge else primaries).append(video_url)
+        backups.extend(backup_urls)
+    candidates: list[str] = []
+    for u in primaries + backups + huge_primaries:
+        if u and u not in candidates:
+            candidates.append(u)
+    return title, candidates
+
+
+def parse_link(url: str) -> tuple[str, str]:
+    """Back-compat wrapper: first candidate only."""
+    title, candidates = parse_candidates(url)
+    return candidates[0], title
 
 
 def download_video(video_url: str, dest: Path) -> None:
@@ -323,6 +374,38 @@ def download_video(video_url: str, dest: Path) -> None:
             raise PipelineError("download", "视频下载下来是空文件")
         return
     raise PipelineError("download", f"视频下载失败: {last_exc}")
+
+
+def download_video_any(candidates: list[str], dest: Path) -> str:
+    """Try each candidate URL in order until one downloads.
+
+    A candidate that fails (e.g. its CDN host is unreachable from this
+    server) must not poison the next one: the partial file and any
+    .part* chunks are deleted first, because download_video resumes from
+    the existing file size -- resuming a different video's bytes would
+    corrupt the file. Returns the URL that worked."""
+    last_error = "没有可用的下载地址"
+    for video_url in candidates:
+        for suffix in ("", ".part0", ".part1", ".part2", ".part3"):
+            try:
+                (dest.with_suffix(suffix) if suffix else dest).unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            download_video(video_url, dest)
+        except PipelineError as exc:
+            last_error = exc.message
+            continue
+        except Exception as exc:  # pragma: no cover - safety net
+            last_error = str(exc)
+            continue
+        if dest.exists() and dest.stat().st_size > 0:
+            return video_url
+        last_error = "视频下载下来是空文件"
+    raise PipelineError(
+        "download",
+        f"视频下载失败，试了{len(candidates)}个地址都连不上（{last_error}），请过一会儿再试",
+    )
 
 
 def _download_parallel(video_url: str, dest: Path, total: int, headers: dict) -> None:
@@ -865,10 +948,23 @@ def do_transcribe(
     with tempfile.TemporaryDirectory(prefix="vts-") as tmp:
         tmpdir = Path(tmp)
         stage("parse")
-        video_url, title = parse_link(url)
+        title, candidates = parse_candidates(url)
         stage("download")
         video_path = tmpdir / "video.mp4"
-        download_video(video_url, video_path)
+        try:
+            download_video_any(candidates, video_path)
+        except PipelineError:
+            # All candidates failed: re-parse once for fresh signed URLs
+            # (CDN hosts rotate per parse, e.g. v11/v13-default.365yg.com)
+            # and try any addresses we have not tried yet.
+            try:
+                _title, fresh = parse_candidates(url)
+                new_candidates = [u for u in fresh if u not in candidates]
+            except PipelineError:
+                new_candidates = []
+            if not new_candidates:
+                raise
+            download_video_any(new_candidates, video_path)
         stage("audio")
         duration = probe_duration(video_path)
         audio_path = extract_audio(video_path, tmpdir)
