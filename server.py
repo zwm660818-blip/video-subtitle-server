@@ -79,6 +79,9 @@ PROOFREAD_SYSTEM = (
     "注意常见的固定说法：说话里常用“这步棋”“这一招”“这一手”这类讲策略的固定说法；"
     "如果某行读起来别扭、又和某个固定说法发音接近，优先按固定说法修正"
     "（例如“这不岂是多妙”很可能是“这步棋有多妙”）；"
+    "讲学习、看辩论、长见识的语境里，“找脑子”应为“长脑子”"
+    "（长和找发音接近，Whisper 常把“长脑子”听成“找脑子”，"
+    "而“找脑子”字面是“寻找脑子”，讲不通）；"
     "如果某行里的型号、编号与上面列出的反复出现的型号只差一两个字母，优先按反复出现的那个修正"
     "（例如视频里 CT5 出现多次，某行出现 CP5 很可能是把 T 听成了 P）；"
     "注意中英夹杂：说话人有时会说英文单词，转写可能把英文听成了中文同音字"
@@ -738,6 +741,33 @@ def _proofread_batch(
     return {}
 
 
+# Deterministic fixed-phrase corrections, applied after the LLM proofreader.
+# These are Whisper homophone traps the proofreader has already missed in
+# real videos, so they are enforced in code instead of relying on the model:
+# - "找脑子" -> "长脑子": Whisper hears 长 (zhang) as 找 (zhao) in both
+#   fast and accurate modes; user reported 2026-11-18 on the debate video
+#   ("长脑子最累的方式就是多看辩论赛"), proofreader changed 6 other lines
+#   in that job but left this one. "长脑子" is the idiom for growing one's
+#   brain; "找脑子" (searching for a brain) makes no sense in context.
+FIXED_PHRASES = {
+    "找脑子": "长脑子",
+}
+
+
+def _apply_fixed_phrases(segments: list[dict]) -> int:
+    """Replace known misheard fixed phrases; returns number of lines changed."""
+    changed = 0
+    for seg in segments:
+        text = seg.get("text", "")
+        new_text = text
+        for wrong, right in FIXED_PHRASES.items():
+            new_text = new_text.replace(wrong, right)
+        if new_text != text:
+            seg["text"] = new_text
+            changed += 1
+    return changed
+
+
 def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[list[dict], dict]:
     """Fix Whisper homophone errors with an LLM, keeping timestamps.
 
@@ -1017,6 +1047,10 @@ def do_transcribe(
                     proofread_stats["annotated"] = annotated
                 except Exception:
                     pass
+            # Fixed-phrase corrections run after the LLM proofreader (and
+            # after annotating, so a gloss never lands on a wrong phrase):
+            # the model has missed these in real jobs, code enforces them.
+            proofread_stats["fixed_phrases"] = _apply_fixed_phrases(segments)
             # Normalize everything to Simplified Chinese: Whisper (language="zh")
             # often outputs Traditional, and the proofreader doesn't rewrite lines
             # it thinks are already right, so Traditional slips through. This is
