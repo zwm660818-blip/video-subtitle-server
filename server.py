@@ -412,34 +412,52 @@ def extract_audio(video_path: Path, tmpdir: Path) -> Path:
 
 
 def split_audio(mp3_path: Path, duration: float, tmpdir: Path) -> list[tuple[Path, float]]:
-    """Split the mp3 into chunks under the Groq size limit.
+    """Split the audio into chunks under the Groq size limit.
 
-    Returns a list of (chunk_path, time_offset_seconds).
+    Returns a list of (chunk_path, time_offset_seconds). Each chunk is cut
+    with a stream copy (no re-encode, nearly instant) when the source
+    allows it; falls back to re-encoding to 128k MP3. Chunk length is
+    sized by the MP3 output bitrate (23 MB / 16 KB/s = 1507s), which is
+    safe for both AAC and MP3 sources.
     """
     size = mp3_path.stat().st_size
     if size <= MAX_GROQ_BYTES:
         return [(mp3_path, 0.0)]
-    # Chunks are re-encoded to 128k MP3 (~16 KB/s), so size them by the
-    # OUTPUT bitrate, not the input file size: an .m4a input (AAC, smaller
-    # per minute) would otherwise make chunks that exceed Groq's 25 MB
-    # limit after re-encoding. 23 MB target leaves a safety margin.
     chunk_seconds = max(60, (23 * 1024 * 1024) // 16000)
     chunks: list[tuple[Path, float]] = []
     start = 0.0
     index = 0
     while start < duration:
-        chunk_path = tmpdir / f"chunk{index}.mp3"
-        _run(
-            [
-                "ffmpeg", "-y", "-v", "error",
-                "-ss", str(start), "-t", str(chunk_seconds),
-                "-i", str(mp3_path),
-                "-vn", "-c:a", "libmp3lame", "-b:a", "128k",
-                str(chunk_path),
-            ],
-            "audio",
-            "切分长音频",
-        )
+        chunk_path = tmpdir / f"chunk{index}.m4a"
+        copied = False
+        try:
+            _run(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-ss", str(start), "-t", str(chunk_seconds),
+                    "-i", str(mp3_path),
+                    "-vn", "-c:a", "copy",
+                    str(chunk_path),
+                ],
+                "audio",
+                "切分长音频",
+            )
+            copied = chunk_path.stat().st_size > 0
+        except (PipelineError, OSError):
+            copied = False
+        if not copied:
+            chunk_path = tmpdir / f"chunk{index}.mp3"
+            _run(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-ss", str(start), "-t", str(chunk_seconds),
+                    "-i", str(mp3_path),
+                    "-vn", "-c:a", "libmp3lame", "-b:a", "128k",
+                    str(chunk_path),
+                ],
+                "audio",
+                "切分长音频",
+            )
         chunks.append((chunk_path, start))
         start += chunk_seconds
         index += 1
