@@ -4,9 +4,9 @@ POST /transcribe starts a background job and returns a job_id immediately
 (long videos take 2-4 minutes, past the platform proxy's ~2 minute limit
 for one request). Poll GET /jobs/{id} until status is done or error.
 
-Pipeline: zacao parse -> download -> ffmpeg audio extract -> Groq
-transcribe (chunked if the mp3 is over 25 MB) -> LLM proofread of
-homophone errors.
+Pipeline: parse (zacao, hk0.cc fallback) -> download -> ffmpeg audio
+extract -> Groq transcribe (chunked if the mp3 is over 25 MB) -> LLM
+proofread of homophone errors.
 
 The Groq API key comes ONLY from the GROQ_API_KEY environment variable.
 No secret is stored in this code.
@@ -33,6 +33,22 @@ CHROME_UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 ZACAO_URL = "https://video.zacao.top/api/parse/v2"
+HK0_BASE = "https://api.hk0.cc/api"
+# hk0.cc fallback parser (no key needed). zacao's WeChat parser broke on
+# 2026-11-18 (HTTP 401 for every WeChat link; Douyin/Kuaishou still fine),
+# while hk0.cc parses WeChat/Douyin/Kuaishou/Bilibili. Response shape:
+# {"code":200,"msg":"解析成功","data":{"url": direct mp4, "title": ...}}.
+HK0_ENDPOINTS = [
+    ("weixin.qq.com", "wxsph"),
+    ("channels.weixin.qq.com", "wxsph"),
+    ("douyin.com", "douyin"),
+    ("v.douyin.com", "douyin"),
+    ("kuaishou.com", "ksjx"),
+    ("v.kuaishou.com", "ksjx"),
+    ("bilibili.com", "bilibili"),
+    ("xiaohongshu.com", "xhs"),
+    ("weibo.com", "weibo"),
+]
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 # Proofreading model: Qwen is the strongest Chinese model on Groq's free tier.
@@ -154,8 +170,8 @@ def _run(cmd: list[str], step: str, what: str) -> str:
 
 # ---------------------------------------------------------------- pipeline
 
-def parse_link(url: str) -> tuple[str, str]:
-    """Step 1: resolve the short link to a direct video URL via zacao."""
+def _parse_via_zacao(url: str) -> tuple[str, str] | None:
+    """Try zacao. Returns (video_url, title) or None on any failure."""
     try:
         resp = httpx.get(
             ZACAO_URL,
@@ -164,16 +180,16 @@ def parse_link(url: str) -> tuple[str, str]:
             timeout=httpx.Timeout(60.0, connect=10.0),
             follow_redirects=True,
         )
-    except httpx.RequestError as exc:
-        raise PipelineError("parse", f"解析服务连不上: {exc}")
+    except httpx.RequestError:
+        return None
     if resp.status_code != 200:
-        raise PipelineError("parse", f"解析服务返回 HTTP {resp.status_code}")
+        return None
     try:
         payload = resp.json()
     except json.JSONDecodeError:
-        raise PipelineError("parse", "解析服务返回了无法识别的内容")
+        return None
     if payload.get("code") != 200:
-        raise PipelineError("parse", "这个链接解析不出来，换个链接试试")
+        return None
     data = payload.get("data") or {}
     video_url = (
         data.get("source_video_url")
@@ -181,7 +197,7 @@ def parse_link(url: str) -> tuple[str, str]:
         or data.get("video_url")
     )
     if not video_url:
-        raise PipelineError("parse", "解析成功了，但没拿到视频地址")
+        return None
     title = (
         data.get("title")
         or data.get("desc")
@@ -189,6 +205,61 @@ def parse_link(url: str) -> tuple[str, str]:
         or "未命名视频"
     )
     return video_url, str(title)
+
+
+def _parse_via_hk0(url: str) -> tuple[str, str] | None:
+    """Try hk0.cc (no key). Returns (video_url, title) or None on any failure."""
+    endpoint = None
+    for host, ep in HK0_ENDPOINTS:
+        if host in url:
+            endpoint = ep
+            break
+    if not endpoint:
+        return None
+    try:
+        resp = httpx.get(
+            f"{HK0_BASE}/{endpoint}",
+            params={"url": url},
+            headers={"User-Agent": CHROME_UA},
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            follow_redirects=True,
+        )
+    except httpx.RequestError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        return None
+    if payload.get("code") != 200:
+        return None
+    data = payload.get("data") or {}
+    video_url = data.get("url") or data.get("video_url")
+    if not video_url:
+        return None
+    title = data.get("title") or data.get("desc") or "未命名视频"
+    return video_url, str(title)
+
+
+def parse_link(url: str) -> tuple[str, str]:
+    """Step 1: resolve the short link to a direct video URL.
+    zacao first; hk0.cc fallback. WeChat goes hk0.cc first because zacao's
+    WeChat parser returns 401 since 2026-11-18."""
+    is_wechat = "weixin.qq.com" in url or "channels.weixin.qq.com" in url
+    attempts = (
+        [_parse_via_hk0, _parse_via_zacao] if is_wechat
+        else [_parse_via_zacao, _parse_via_hk0]
+    )
+    for fn in attempts:
+        try:
+            result = fn(url)
+        except Exception:
+            # A parser must never crash the job; try the next one.
+            continue
+        if result:
+            return result
+    raise PipelineError("parse", "这个链接解析不出来，换个链接试试")
 
 
 def download_video(video_url: str, dest: Path) -> None:
