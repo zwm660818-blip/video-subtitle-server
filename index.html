@@ -916,6 +916,49 @@ function translateTextsClientSide(texts){
     return Promise.all(jobs);
   });
 }
+/* 在历史记录里找当前这条视频存过的译文：按链接匹配，链接没有就按标题+时长匹配。
+   找不到返回 null。 */
+function findHistoryTranslation(){
+  if(!lastResult) return null;
+  var url = lastResult.url || '';
+  var title = lastResult.title || '';
+  var dur = lastResult.duration;
+  var list = loadHistory();
+  for(var i = 0; i < list.length; i++){
+    var rec = list[i];
+    if(!rec || !Array.isArray(rec._translatedSegments) || !rec._translatedSegments.length) continue;
+    if(url && rec.url && rec.url === url) return rec._translatedSegments;
+    if(!url && title && rec.title === title && rec.duration === dur) return rec._translatedSegments;
+    /* 兜底：链接和标题都对不上时，按第一段原文内容匹配 */
+    if(rec._origSegments && rec._origSegments.length && lastResult.segments && lastResult.segments.length
+      && rec._origSegments[0].text === lastResult.segments[0].text
+      && rec._origSegments.length === lastResult.segments.length){
+      return rec._translatedSegments;
+    }
+  }
+  return null;
+}
+/* 把带译文的上次结果可靠地存下来：写完读回验证；本地空间不够时，先清掉历史里
+   旧记录的译文腾地方，再存；还是存不下就放弃，不让页面报错。 */
+function saveTranslationReliably(){
+  if(!lastResult) return;
+  var payload = JSON.stringify(lastResult);
+  try {
+    window.localStorage.setItem(LS_RESULT, payload);
+    if(window.localStorage.getItem(LS_RESULT) === payload) return;
+  } catch(e) {}
+  /* 写满了或没写进去：清历史旧记录的译文腾地方，再试一次 */
+  try {
+    var list = loadHistory();
+    var changed = false;
+    list.forEach(function(rec){
+      if(rec && rec._translatedSegments){ delete rec._translatedSegments; changed = true; }
+      if(rec && rec._origSegments){ delete rec._origSegments; changed = true; }
+    });
+    if(changed) saveHistoryList(list);
+    window.localStorage.setItem(LS_RESULT, payload);
+  } catch(e) {}
+}
 async function toggleTranslate(){
   if(!lastResult){ toast('还没有转写结果'); return; }
   var btn = document.getElementById('translate-btn');
@@ -939,6 +982,22 @@ async function toggleTranslate(){
     renderLines(lastResult);
     updateTranslateBtn();
     try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
+    return;
+  }
+  /* 译文只存在历史那份拷贝里（上次结果那份没有）：先把它捡回来直接显示，不用重翻。
+     按链接匹配，链接没有就按标题+时长匹配。 */
+  var histTrans = findHistoryTranslation();
+  if(histTrans){
+    originalSegments = lastResult.segments.map(function(s){ return { start: s.start, end: s.end, text: s.text }; });
+    translatedSegments = histTrans;
+    lastResult._origSegments = originalSegments;
+    lastResult._translatedSegments = translatedSegments;
+    lastResult.segments = translatedSegments;
+    lastResult.transcript = translatedSegments.map(function(s){ return s.text || ''; }).join('\n');
+    showingTranslation = true;
+    renderLines(lastResult);
+    updateTranslateBtn();
+    saveTranslationReliably();
     return;
   }
   var segs = lastResult.segments || [];
@@ -983,7 +1042,25 @@ async function toggleTranslate(){
   showingTranslation = true;
   renderLines(lastResult);
   updateTranslateBtn();
-  try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
+  saveTranslationReliably();
+  /* 译文也写回历史里那条记录，下次从历史打开还能直接切中文 */
+  try {
+    var hist = loadHistory();
+    var matched = false;
+    hist.forEach(function(rec){
+      if(!rec) return;
+      var sameUrl = lastResult.url && rec.url && rec.url === lastResult.url;
+      var sameTitle = !lastResult.url && rec.title === lastResult.title && rec.duration === lastResult.duration;
+      var sameFirst = rec.segments && rec.segments.length && lastResult.segments.length
+        && rec.segments[0].text === translatedSegments[0].text;
+      if(sameUrl || sameTitle || sameFirst){
+        rec._origSegments = originalSegments;
+        rec._translatedSegments = translatedSegments;
+        matched = true;
+      }
+    });
+    if(matched) saveHistoryList(hist);
+  } catch(e) {}
   toast('已翻译成中文');
 }
 
