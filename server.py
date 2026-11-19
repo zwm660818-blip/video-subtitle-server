@@ -65,6 +65,38 @@ GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 # llama-3.3-70b-versatile no longer exists on this account (404).
 PROOFREAD_MODEL = "qwen/qwen3.8-27b"
 PROOFREAD_BATCH = 100  # segments per LLM call
+
+# Groq free tier for the chat model: 8000 tokens/min, shared across every
+# chat call this key makes (proofread + annotate). With punctuation on, the
+# proofreader returns nearly every line, so one 100-line batch costs ~3700
+# tokens (measured 2026-11-19: 2364 prompt + 1318 completion) and the 3rd
+# batch inside a minute got 429 -> a 65s retry wait. That is why the
+# "整理字幕" step felt slow on long videos (user reported 2026-11-19).
+# Pace calls by the tokens the key actually used in the last 60s instead
+# of hammering the limit and eating 65s retries.
+_CHAT_TOKEN_WINDOW = 60.0
+_CHAT_TOKEN_LIMIT = 7900  # just under Groq's 8000/min
+_CHAT_TOKEN_LOG: list[tuple[float, int]] = []  # (monotonic time, tokens)
+_CHAT_TOKEN_LOCK = threading.Lock()
+
+
+def _wait_for_chat_budget(estimate: int) -> None:
+    """Sleep until this key's token use in the last 60s + estimate fits
+    under the free-tier limit. The estimate comes from the request itself
+    (input tokens + expected output), so a short video never waits at all
+    and a long one spreads its batches across minute windows instead of
+    failing into 65s retries."""
+    while True:
+        with _CHAT_TOKEN_LOCK:
+            now = time.monotonic()
+            _CHAT_TOKEN_LOG[:] = [
+                (t, n) for t, n in _CHAT_TOKEN_LOG if now - t < _CHAT_TOKEN_WINDOW
+            ]
+            used = sum(n for _, n in _CHAT_TOKEN_LOG)
+            if used + estimate <= _CHAT_TOKEN_LIMIT:
+                return
+            oldest = _CHAT_TOKEN_LOG[0][0]
+        time.sleep(max(1.0, _CHAT_TOKEN_WINDOW - (time.monotonic() - oldest) + 0.5))
 TRANSLATE_BATCH = 50  # segments per LLM call (translation is heavier)
 TRANSLATE_SYSTEM = (
     "你是英中翻译。用户给你一段英文语音转写的分段文本，每行前面有编号。"
@@ -804,7 +836,13 @@ def _proofread_batch(
     if anchors:
         user_msg += f"视频中反复出现的型号/编号：{anchors}\n"
     user_msg += f"转写分段：\n{numbered}"
+    # Token cost of this call, for the pacing check: input tokens from the
+    # request size, output tokens ~ input when punctuation is on (the model
+    # returns nearly every line, max_tokens 8192) and small otherwise.
+    input_tokens = int((len(system) + len(user_msg)) / 1.5)
+    est_tokens = input_tokens + (input_tokens if max_tokens > 4096 else 300)
     for attempt in range(4):
+        _wait_for_chat_budget(est_tokens)
         try:
             resp = httpx.post(
                 GROQ_CHAT_URL,
@@ -837,9 +875,18 @@ def _proofread_batch(
         if resp.status_code != 200:
             return None
         try:
-            content = resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
         except Exception:
             return None
+        # Record what this call actually spent, so the next call paces
+        # against the real budget instead of guessing.
+        try:
+            spent = int(data.get("usage", {}).get("total_tokens") or 0)
+        except Exception:
+            spent = 0
+        with _CHAT_TOKEN_LOCK:
+            _CHAT_TOKEN_LOG.append((time.monotonic(), spent or est_tokens))
         parsed: dict[int, str] = {}
         for line in content.strip().splitlines():
             line = line.strip().strip("`").strip()
