@@ -69,9 +69,9 @@
   .result-head label{ margin-bottom:0; }
   .ts-toggle{ display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:600; color:#6b7280; flex-shrink:0; }
   .line{ display:flex; gap:10px; padding:9px 0; border-bottom:1px solid #f3f4f6; font-size:14px; line-height:1.9; }
-  .line:last-child{border-bottom:0}
   .sent{ display:block; margin-bottom:8px; }
   .sent:last-child{ margin-bottom:0; }
+  .line:last-child{border-bottom:0}
   .t{ font-variant-numeric:tabular-nums; color:#2563eb; font-weight:700; font-size:12.5px; flex-shrink:0; padding-top:3px; background:none;border:0;cursor:pointer;padding-left:0;padding-right:0; min-height:auto; }
   .plain-text{ font-size:14px; line-height:1.8; white-space:pre-wrap; word-break:break-word; }
   .actions{ display:flex; gap:8px; margin:2px 0 12px; flex-wrap:wrap; }
@@ -133,12 +133,13 @@
       <button class="on" data-mode="accurate" onclick="seg(this)">准 · 1 分钟</button>
     </div>
     <div style="height:6px"></div>
-    <div class="a-row"><span>自动加标点</span><button class="switch on" id="punct-switch" onclick="togglePunct()" aria-label="自动加标点开关"></button></div>
+    <div class="a-row"><span>自动加标点</span><button class="switch on" id="punct-switch" onclick="togglePunctuate()" aria-label="自动加标点开关"></button></div>
     <div class="a-row"><span>转完顺手总结</span><button class="switch" id="summary-switch" onclick="this.classList.toggle('on')" aria-label="转完总结开关"></button></div>
-    <div class="a-row"><span>英文词加中文释义</span><button class="switch on" id="annotate-switch" onclick="toggleAnnotate()" aria-label="英文词加中文释义开关"></button></div>
+    <div class="a-row"><span>英文词加中文释义</span><button class="switch on" id="annotate-switch" onclick="this.classList.toggle('on')" aria-label="英文词加中文释义开关"></button></div>
   </div>
 
   <div class="srv-status" id="srv-status"></div>
+
   <button class="a-cta" id="cta" onclick="runTranscribe()">开始转字幕</button>
 
   <div class="a-card steps" id="steps">
@@ -165,7 +166,7 @@
       <button class="primary" onclick="copyAll()">复制全文</button>
       <button class="ghost" onclick="downloadTxt()">下载 .txt</button>
       <button class="ghost" onclick="showSummary()">总结</button>
-      <button class="ghost" id="translate-btn" style="display:none" onclick="toggleTranslate()">翻译成中文</button>
+      <button class="ghost" id="translate-btn" onclick="toggleTranslate()" style="display:none">翻译成中文</button>
     </div>
     <div class="lines" id="lines"></div>
     <div class="proofread-note" id="proofread-note"></div>
@@ -186,46 +187,29 @@ var WAKE_WAIT_MS = 3 * 60 * 1000; /* 等服务器醒最多等 3 分钟 */
 var AWAKE_FRESH_MS = 5 * 60 * 1000; /* 5 分钟内确认过服务器醒着，点开始就直接提交 */
 
 var currentMode = 'accurate';
-var lastResult = null;   /* { title, duration, transcript, segments } */
+var lastResult = null;   /* { title, duration, transcript, segments, language } */
 var running = false;
+/* ---------- 翻译状态：原文 / 译文切换，复制和下载用当前显示的版本 ---------- */
+var translatedSegments = null;   /* null = 还没翻译过；数组 = 已翻译的分段（时间点与原文一致） */
+var translatedTranscript = '';
+var showingTranslated = false;
+var translating = false;
+var currentIsEnglish = false;
 
 /* ---------- 本地保存：时间点开关、上次转好的结果、进行中的任务（刷新不丢） ---------- */
 var LS_TS = 'vts.showTimestamps';
+var LS_PUNCT = 'vts.punctuate';
 var LS_RESULT = 'vts.lastResult';
 var LS_JOB = 'vts.pendingJob';
 var LS_HISTORY = 'vts.history';
-var LS_ANNOTATE = 'vts.annotateEnglish';
-var LS_PUNCT = 'vts.punctuate';
 var HISTORY_MAX = 20;
 var showTimestamps = true;
-var annotateEnglish = true;   /* 英文词后面加（中文意思），默认开 */
-var punctuateOn = true;   /* 自动加标点，默认开：校对时给没标点的句子断句加标点 */
 function storeGet(k){ try { return window.localStorage.getItem(k); } catch(e) { return null; } }
 function storeSet(k, v){ try { window.localStorage.setItem(k, v); } catch(e) {} }
 function storeRemove(k){ try { window.localStorage.removeItem(k); } catch(e) {} }
 if(storeGet(LS_TS) === '0') showTimestamps = false;
-if(storeGet(LS_ANNOTATE) === '0') annotateEnglish = false;
+var punctuateOn = true;   /* 自动加标点：默认开，状态存 localStorage，提交任务时随请求发给后端 */
 if(storeGet(LS_PUNCT) === '0') punctuateOn = false;
-
-function applyAnnotateSwitch(){
-  var sw = document.getElementById('annotate-switch');
-  if(sw) sw.classList.toggle('on', annotateEnglish);
-}
-function toggleAnnotate(){
-  annotateEnglish = !annotateEnglish;
-  storeSet(LS_ANNOTATE, annotateEnglish ? '1' : '0');
-  applyAnnotateSwitch();
-}
-function applyPunctSwitch(){
-  var sw = document.getElementById('punct-switch');
-  if(sw) sw.classList.toggle('on', punctuateOn);
-}
-function togglePunct(){
-  punctuateOn = !punctuateOn;
-  storeSet(LS_PUNCT, punctuateOn ? '1' : '0');
-  applyPunctSwitch();
-}
-applyPunctSwitch();
 
 /* ---------- 常见英文词释义清理：结果一拿到就去掉这些词后面的中文释义括号 ----------
    后端校对会给英文词加中文释义，但常见词/品牌/模型名不需要。显示、复制、下载、
@@ -255,6 +239,368 @@ function cleanResultData(data){
   return data;
 }
 
+/* ---------- 英文判定 + 翻译 ---------- */
+function isEnglishResult(data){
+  if(!data) return false;
+  var text = '';
+  if(Array.isArray(data.segments) && data.segments.length){
+    text = data.segments.map(function(s){ return s.text || ''; }).join('');
+  } else {
+    text = data.transcript || '';
+  }
+  var zh = 0, latin = 0;
+  for(var i = 0; i < text.length; i++){
+    var c = text.charAt(i);
+    if(c >= '一' && c <= '鿿') zh++;
+    else if(/[A-Za-z]/.test(c)) latin++;
+  }
+  var letters = zh + latin;
+  if(letters >= 20){
+    /* 正文说了算：拉丁字母占绝大多数就是英文结果。
+       后端给的 language 字段不可靠（旧后端会把英文字幕也标成 zh），不能让它一票否决，
+       之前按钮不出现就是被这个字段挡住的 */
+    return latin > 0 && (zh / letters) < 0.2;
+  }
+  if(letters > 0) return latin > zh;
+  /* 正文没法判断时才看后端给的 language 字段 */
+  var lang = String(data.language || data.lang || '').toLowerCase();
+  if(lang.indexOf('en') === 0 || lang === 'english') return true;
+  return false;
+}
+function displayData(){
+  if(!lastResult) return null;
+  if(showingTranslated && (translatedSegments || translatedTranscript)){
+    return {
+      title: lastResult.title, duration: lastResult.duration,
+      segments: translatedSegments,
+      transcript: translatedTranscript || (translatedSegments ? translatedSegments.map(function(s){ return s.text || ''; }).join('') : ''),
+      language: lastResult.language
+    };
+  }
+  return lastResult;
+}
+function updateTranslateBtn(){
+  var btn = document.getElementById('translate-btn');
+  if(!btn) return;
+  if(!currentIsEnglish || !lastResult){ btn.style.display = 'none'; return; }
+  btn.style.display = '';
+  btn.disabled = translating;
+  btn.textContent = translating ? '翻译中…' : (showingTranslated ? '查看原文' : '翻译成中文');
+}
+function storeSetVerified(k, v){
+  try {
+    window.localStorage.setItem(k, v);
+    return window.localStorage.getItem(k) === v;
+  } catch(e) { return false; }
+}
+function freeStorageSpace(){
+  /* 本地空间满了：先去掉历史里旧记录的译文（原文保留），腾出地方存当前这条的译文 */
+  try {
+    var list = loadHistory();
+    var changed = false;
+    for(var i = 1; i < list.length; i++){
+      if(list[i].translatedSegments || list[i].translatedTranscript){
+        list[i].translatedSegments = null;
+        list[i].translatedTranscript = '';
+        changed = true;
+      }
+    }
+    if(changed) saveHistoryList(list);
+  } catch(e) {}
+}
+function persistTranslation(){
+  if(!lastResult) return;
+  lastResult.translatedSegments = translatedSegments;
+  lastResult.translatedTranscript = translatedTranscript;
+  var savedAt = lastResult.savedAt || null;
+  try {
+    var saved = null;
+    try { saved = JSON.parse(storeGet(LS_RESULT) || 'null'); } catch(e) {}
+    /* 存着的“上次结果”不是当前这条时不覆盖它，免得把更新的一条冲掉 */
+    var mismatch = saved && savedAt && saved.savedAt && saved.savedAt !== savedAt;
+    if(saved && !mismatch){
+      saved.translatedSegments = translatedSegments;
+      saved.translatedTranscript = translatedTranscript;
+      if(lastResult.language && !saved.language) saved.language = lastResult.language;
+      /* 写完读回来确认真的存住了：空间满时写入会静默失败，刷新一次译文就丢、
+         又要重新翻译，所以写不下就先清历史旧译文腾地方，再重试一次 */
+      if(!storeSetVerified(LS_RESULT, JSON.stringify(saved))){
+        freeStorageSpace();
+        storeSetVerified(LS_RESULT, JSON.stringify(saved));
+      }
+    }
+    /* 同步更新历史里同一条：优先按当前结果的 savedAt 对准，
+       没有就用存着的“上次结果”的 savedAt（两份本来就是同一条） */
+    var matchAt = savedAt || (saved && saved.savedAt) || null;
+    if(matchAt){
+      var list = loadHistory();
+      var changedHist = false;
+      list.forEach(function(e){
+        if(e.savedAt === matchAt){
+          e.translatedSegments = translatedSegments;
+          e.translatedTranscript = translatedTranscript;
+          if(lastResult.language && !e.language) e.language = lastResult.language;
+          changedHist = true;
+        }
+      });
+      if(changedHist) saveHistoryList(list);
+    }
+  } catch(e) {}
+}
+/* 内存里没有译文时，先翻本地存过的两份（上次结果、历史记录）：
+   找到同一条以前存下的译文就直接用，不再发翻译请求 */
+function adoptStoredTranslation(){
+  if(!lastResult || !lastResult.savedAt) return false;
+  var candidates = [];
+  try {
+    var s = JSON.parse(storeGet(LS_RESULT) || 'null');
+    if(s) candidates.push(s);
+  } catch(e) {}
+  loadHistory().forEach(function(e){ candidates.push(e); });
+  for(var i = 0; i < candidates.length; i++){
+    var c = candidates[i];
+    if(c.savedAt === lastResult.savedAt && (Array.isArray(c.translatedSegments) || c.translatedTranscript)){
+      translatedSegments = Array.isArray(c.translatedSegments) ? c.translatedSegments : null;
+      translatedTranscript = c.translatedTranscript || '';
+      lastResult.translatedSegments = translatedSegments;
+      lastResult.translatedTranscript = translatedTranscript;
+      return true;
+    }
+  }
+  return false;
+}
+function parseTranslatedResult(out, originalSegs, wasSegmented){
+  if(!out || !out.data || (out.res && !out.res.ok)) throw new Error('translate failed');
+  var d = out.data;
+  var rawSegs = null, rawTranscript = '';
+  if(Array.isArray(d)){ rawSegs = d; }
+  else {
+    if(Array.isArray(d.segments)) rawSegs = d.segments;
+    else if(Array.isArray(d.translated_segments)) rawSegs = d.translated_segments;
+    else if(Array.isArray(d.translations)) rawSegs = d.translations;
+    else if(Array.isArray(d.texts)) rawSegs = d.texts;
+    else if(d.result && Array.isArray(d.result.segments)) rawSegs = d.result.segments;
+    else if(d.result && Array.isArray(d.result.translations)) rawSegs = d.result.translations;
+    if(typeof d.transcript === 'string') rawTranscript = d.transcript;
+    else if(typeof d.translated_transcript === 'string') rawTranscript = d.translated_transcript;
+    else if(typeof d.translation === 'string') rawTranscript = d.translation;
+    else if(typeof d.text === 'string') rawTranscript = d.text;
+    else if(d.result && typeof d.result.transcript === 'string') rawTranscript = d.result.transcript;
+  }
+  if(!rawSegs && !rawTranscript && d.data && typeof d.data === 'object'){
+    var inner = d.data;
+    if(Array.isArray(inner.segments)) rawSegs = inner.segments;
+    else if(Array.isArray(inner.translations)) rawSegs = inner.translations;
+    if(typeof inner.transcript === 'string') rawTranscript = inner.transcript;
+    else if(typeof inner.translation === 'string') rawTranscript = inner.translation;
+  }
+  if(!rawTranscript && typeof d.translated === 'string') rawTranscript = d.translated;
+  if(!rawTranscript && typeof d.translated_text === 'string') rawTranscript = d.translated_text;
+  if(rawSegs && rawSegs.length){
+    var segs = rawSegs.map(function(item, i){
+      var orig = originalSegs[i] || {};
+      if(typeof item === 'string') return { start: orig.start, end: orig.end, text: item };
+      var txt = item.text || item.translated_text || item.translation || item.content || '';
+      return { start: (item.start !== undefined ? item.start : orig.start), end: (item.end !== undefined ? item.end : orig.end), text: txt };
+    });
+    if(!wasSegmented){
+      return { segments: null, transcript: rawTranscript || segs.map(function(s){ return s.text || ''; }).join('') };
+    }
+    return { segments: segs, transcript: rawTranscript || segs.map(function(s){ return s.text || ''; }).join('') };
+  }
+  if(rawTranscript){
+    return { segments: null, transcript: rawTranscript };
+  }
+  throw new Error('translate empty');
+}
+function postTranslate(payload){
+  return fetchT(API_BASE + '/translate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }, 30000).then(function(res){
+    return res.text().then(function(text){
+      var data = null;
+      try { data = JSON.parse(text); } catch(e) {}
+      return { res: res, data: data, text: text };
+    });
+  });
+}
+/* ---------- 页面直连翻译：后端 /translate 接口还没上线（实测 404）时，空间自己翻 ----------
+   分段按换行拼成批一起送翻，译文按行拆回，段数和时间点与原文一一对应；
+   某一批拆不齐就逐段补翻。两个公开翻译通道轮流兜底，一个不通换下一个。 */
+function fetchJsonWithTimeout(url, ms){
+  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, ms || 20000) : null;
+  return fetch(url, ctrl ? { signal: ctrl.signal } : {}).then(function(res){
+    if(timer) clearTimeout(timer);
+    if(!res.ok) throw new Error('http ' + res.status);
+    return res.json();
+  }, function(err){
+    if(timer) clearTimeout(timer);
+    throw err;
+  });
+}
+function chunkByLength(items, maxChars){
+  var chunks = [], cur = [], len = 0;
+  items.forEach(function(it){
+    var add = it.text.length + 1;
+    if(cur.length && len + add > maxChars){ chunks.push(cur); cur = []; len = 0; }
+    cur.push(it); len += add;
+  });
+  if(cur.length) chunks.push(cur);
+  return chunks;
+}
+function googleTranslateJoined(joined){
+  var url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=' + encodeURIComponent(joined);
+  return fetchJsonWithTimeout(url, 20000).then(function(d){
+    if(!d || !Array.isArray(d[0])) throw new Error('gtx bad response');
+    return d[0].map(function(p){ return (p && p[0]) || ''; }).join('');
+  });
+}
+function myMemoryTranslateJoined(joined){
+  var url = 'https://api.mymemory.translated.net/get?langpair=en%7Czh-CN&q=' + encodeURIComponent(joined);
+  return fetchJsonWithTimeout(url, 20000).then(function(d){
+    if(!d || !d.responseData || d.quotaFinished) throw new Error('mymemory bad response');
+    var t = d.responseData.translatedText;
+    if(typeof t !== 'string' || !t) throw new Error('mymemory empty');
+    return t;
+  });
+}
+async function translateBatchWith(joinFn, items, maxChars){
+  var out = {};
+  var chunks = chunkByLength(items, maxChars);
+  for(var ci = 0; ci < chunks.length; ci++){
+    var chunk = chunks[ci];
+    var joined = chunk.map(function(it){ return it.text; }).join('\n');
+    var translated = await joinFn(joined);
+    var lines = String(translated).split('\n');
+    if(lines.length === chunk.length){
+      chunk.forEach(function(it, i){ out[it.idx] = lines[i]; });
+    } else {
+      /* 整批拆不齐：逐段补翻，保证每段都有对应的译文 */
+      for(var si = 0; si < chunk.length; si++){
+        var one = await joinFn(chunk[si].text);
+        out[chunk[si].idx] = String(one).replace(/\n/g, ' ');
+      }
+    }
+  }
+  return out;
+}
+async function translateTextsClientSide(texts){
+  var items = [];
+  texts.forEach(function(t, i){ if((t || '').trim()) items.push({ idx: i, text: t }); });
+  if(!items.length) return texts.slice();
+  var providers = [
+    function(list){ return translateBatchWith(googleTranslateJoined, list, 1200); },
+    function(list){ return translateBatchWith(myMemoryTranslateJoined, list, 350); }
+  ];
+  for(var pi = 0; pi < providers.length; pi++){
+    try {
+      var map = await providers[pi](items);
+      var result = texts.slice();
+      var ok = true;
+      items.forEach(function(it){
+        if(typeof map[it.idx] === 'string' && map[it.idx]) result[it.idx] = map[it.idx];
+        else ok = false;
+      });
+      if(ok) return result;
+    } catch(e) {}
+  }
+  return null;
+}
+async function toggleTranslate(){
+  if(!lastResult || translating) return;
+  /* 已在看译文：切回原文，不发请求 */
+  if(showingTranslated){
+    showingTranslated = false;
+    updateTranslateBtn();
+    renderLines(displayData());
+    return;
+  }
+  /* 已翻译过：直接切到译文，不重复发请求 */
+  if(translatedSegments || translatedTranscript){
+    showingTranslated = true;
+    updateTranslateBtn();
+    renderLines(displayData());
+    return;
+  }
+  /* 内存里没有，但本地存过这条的译文（比如页面重载后）：捡回来直接用 */
+  if(adoptStoredTranslation()){
+    showingTranslated = true;
+    updateTranslateBtn();
+    renderLines(displayData());
+    return;
+  }
+  var wasSegmented = !!(lastResult.segments && lastResult.segments.length);
+  var originalSegs = wasSegmented ? lastResult.segments : [{ start: 0, end: 0, text: lastResult.transcript || '' }];
+  var texts = originalSegs.map(function(s){ return s.text || ''; });
+  if(!texts.join('').trim()){
+    toast('字幕是空的，没法翻译');
+    return;
+  }
+  translating = true;
+  updateTranslateBtn();
+  toast('正在翻译，请稍等');
+  try {
+    var translatedTexts = null;
+    /* 先试后端翻译接口：等它部署上线后优先走它，只试一次，
+       不再像之前那样唤醒重试干等——接口不存在时立刻走页面直连 */
+    try {
+      var payload = {
+        segments: originalSegs,
+        texts: texts,
+        language: 'en',
+        source_language: 'en',
+        target_language: 'zh',
+        target: 'zh'
+      };
+      var out = await postTranslate(payload);
+      if(out && out.data && out.res && out.res.ok){
+        var parsed = null;
+        try { parsed = parseTranslatedResult(out, originalSegs, wasSegmented); } catch(e) { parsed = null; }
+        if(parsed && wasSegmented && parsed.segments && parsed.segments.length === originalSegs.length){
+          translatedTexts = parsed.segments.map(function(s){ return s.text || ''; });
+        } else if(parsed && !wasSegmented && parsed.transcript){
+          translatedTexts = [parsed.transcript];
+        }
+      }
+    } catch(e) {}
+    /* 后端接口没有或不可用：页面直连公开翻译服务 */
+    if(!translatedTexts) translatedTexts = await translateTextsClientSide(texts);
+    if(!translatedTexts) throw new Error('translate unavailable');
+    if(wasSegmented){
+      translatedSegments = originalSegs.map(function(s, i){
+        return { start: s.start, end: s.end, text: translatedTexts[i] || '' };
+      });
+      translatedTranscript = '';
+    } else {
+      translatedSegments = null;
+      translatedTranscript = translatedTexts[0] || '';
+    }
+    showingTranslated = true;
+    persistTranslation();
+    translating = false;
+    updateTranslateBtn();
+    renderLines(displayData());
+    toast('已翻译成中文');
+  } catch(err) {
+    translating = false;
+    showingTranslated = false;
+    updateTranslateBtn();
+    toast('翻译服务暂不可用，稍后再试', 3500);
+  }
+}
+
+function applyPunctSwitch(){
+  var sw = document.getElementById('punct-switch');
+  if(sw) sw.classList.toggle('on', punctuateOn);
+}
+function togglePunctuate(){
+  punctuateOn = !punctuateOn;
+  storeSet(LS_PUNCT, punctuateOn ? '1' : '0');
+  applyPunctSwitch();
+}
 function applyTsSwitch(){
   var sw = document.getElementById('ts-switch');
   if(sw) sw.classList.toggle('on', showTimestamps);
@@ -263,14 +609,17 @@ function toggleTimestamps(){
   showTimestamps = !showTimestamps;
   storeSet(LS_TS, showTimestamps ? '1' : '0');
   applyTsSwitch();
-  if(lastResult) renderLines(lastResult);
+  if(lastResult) renderLines(displayData());
 }
 function saveResult(data, url){
   cleanResultData(data);
   var rec = {
     title: data.title, duration: data.duration,
     segments: data.segments, transcript: data.transcript,
-    proofread: data.proofread, mode: currentMode, url: url,
+    language: data.language || data.lang || '',
+    translatedSegments: data.translatedSegments || null,
+    translatedTranscript: data.translatedTranscript || '',
+    proofread: data.proofread, timings: data.timings, mode: currentMode, url: url,
     savedAt: Date.now()
   };
   try { storeSet(LS_RESULT, JSON.stringify(rec)); } catch(e) {}
@@ -567,10 +916,7 @@ function plainError(data, httpStatus){
   var step = (data && data.step) ? String(data.step) : '';
   var low = (raw + ' ' + step).toLowerCase();
   var plain = '';
-  if(step === 'download' && /连不上|unreachable|errno|timed out|超时|域名解析/i.test(raw)){
-    /* 服务器自己连不上视频的下载地址（后端已经把解析到的所有地址都试过了），不是视频的问题，也不是额度问题 */
-    plain = '服务器这边连不上这个视频的下载地址，不是你的链接有问题。服务器已经自动换着试了几个地址，过一两分钟再点一次开始通常就好。';
-  } else if(low.indexOf('groq') >= 0 && (low.indexOf('key') >= 0 || low.indexOf('401') >= 0 || low.indexOf('unauthorized') >= 0)){
+  if(low.indexOf('groq') >= 0 && (low.indexOf('key') >= 0 || low.indexOf('401') >= 0 || low.indexOf('unauthorized') >= 0)){
     plain = '转写服务的钥匙（Groq key）不对或者没配好，所以转不了。去 SnapDeploy 的环境变量里检查一下 GROQ_API_KEY 填得对不对。';
   } else if(low.indexOf('429') >= 0 || low.indexOf('rate') >= 0 || low.indexOf('quota') >= 0 || low.indexOf('limit') >= 0){
     plain = '转写服务今天用得太多了，额度到上限了。等一会儿，或者等额度恢复了再试。';
@@ -600,16 +946,20 @@ function hideError(){ document.getElementById('err-box').classList.remove('show'
 
 /* ---------- 主流程：异步任务模式 ----------
    1) POST /transcribe 只提交任务，拿回 job_id（HTTP 202），不等字幕
-   2) 每 5 秒 GET /jobs/{job_id} 轮询，stage 是真实进度
+   2) 每 2 秒 GET /jobs/{job_id} 轮询，stage 是真实进度
    3) status 为 done 渲染结果，error 按老办法翻成大白话
-   POST 回的不是 JSON（服务器睡着时是 503 唤醒页，503 本身叫不醒它）→ 先调唤醒接口，
-   再每 5 秒查一次 GET /health，返回 200 确认醒了才正式提交；最多等 2 分钟，等不到就报错
+   提交前先确认服务器醒着：5 分钟内确认过、或现问一声 /health 返回 200 就直接提交；
+   没醒（或者提交没拿到 JSON）才走唤醒过程，确认醒了再正式提交；最多等 3 分钟，等不到就报错
    全程总超时 15 分钟 */
+function isAnnotateOn(){
+  var el = document.getElementById('annotate-switch');
+  return el ? el.classList.contains('on') : true;
+}
 function postJob(url){
   return fetchT(API_BASE + '/transcribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: url, mode: currentMode, annotate: annotateEnglish, punctuate: punctuateOn })
+    body: JSON.stringify({ url: url, mode: currentMode, annotate: isAnnotateOn(), punctuate: punctuateOn })
   }, 30000).then(function(res){
     return res.text().then(function(text){
       var data = null;
@@ -687,6 +1037,9 @@ async function pollJob(jobId, deadline){
     if(status === 'done' || status === 'success' || status === 'completed'){
       var result = (d.result && (d.result.segments || d.result.transcript)) ? d.result : d;
       if(result.proofread === undefined && d.proofread !== undefined) result.proofread = d.proofread;
+      if(result.timings === undefined && d.timings !== undefined) result.timings = d.timings;
+      if(result.language === undefined && d.language !== undefined) result.language = d.language;
+      if(result.lang === undefined && d.lang !== undefined) result.lang = d.lang;
       if(!result.segments && !result.transcript){
         throw { plain: '服务器说转完了，但里面没有字幕内容。可能是这个视频没有人声。再换一条试试。', raw: out.text ? out.text.slice(0, 200) : '' };
       }
@@ -731,9 +1084,12 @@ async function runTranscribe(){
     applyStage('parse'); /* 任务建好了，等第一轮真实进度回来再往下推 */
     var data = await pollJob(jobId, deadline);
     clearPendingJob();
-    pushHistory(saveResult(data, url));
+    /* 渲染存下来的那份记录（带 savedAt）：之后翻译好的译文要按 savedAt 回存、
+       再打开时也要按它把译文捡回来，渲染原始返回的话对不上号 */
+    var rec = saveResult(data, url);
+    pushHistory(rec);
     finishProgress();
-    renderResult(data, url);
+    renderResult(rec, url);
     cta.disabled = false; cta.textContent = '再转一遍';
     running = false;
   } catch(err) {
@@ -765,15 +1121,15 @@ function renderLines(data){
         t.addEventListener('click', function(){ toast('这一段在原视频 ' + fmtTime(sg.start) + ' 处'); });
         row.appendChild(t);
       }
-      /* 一段按句号/问号/感叹号等断成一句一句显示，字不再挤成一整坨；时间点只留在第一句前面 */
-      var box = document.createElement('div'); box.style.flex = '1'; box.style.minWidth = '0';
-      var parts = (sg.text || '').match(/[^。！？；…]+[。！？；…]?/g) || [];
-      if(!parts.length) parts = [sg.text || ''];
-      parts.forEach(function(p){
-        var d = document.createElement('div'); d.className = 'sent'; d.textContent = p;
-        box.appendChild(d);
+      var span = document.createElement('span');
+      /* 按句分行：每段按 。！？；… 断成一句一句，每句单独一行，读起来不挤；
+         没有中文标点的英文整句不断开；空文本 match 返回 null 时兜底成一段空文本 */
+      var sentences = String(sg.text || '').match(/[^。！？；…]+[。！？；…]?/g) || [''];
+      sentences.forEach(function(sent){
+        var ss = document.createElement('span'); ss.className = 'sent'; ss.textContent = sent;
+        span.appendChild(ss);
       });
-      row.appendChild(box);
+      row.appendChild(span);
       lines.appendChild(row);
     });
   } else {
@@ -786,21 +1142,13 @@ function renderResult(data, url, opts){
   /* 兜底：从历史/上次结果恢复的旧数据也先清理一遍再显示，保证复制和下载同样干净 */
   cleanResultData(data);
   lastResult = data;
-  /* 恢复翻译状态：本地存的记录若带原文+译文，说明翻过；
-     当前显示的是哪边，就按 segments 里的内容判断 */
-  var hasOrig = Array.isArray(data._origSegments) && data._origSegments.length;
-  var hasTrans = Array.isArray(data._translatedSegments) && data._translatedSegments.length;
-  if(hasOrig && hasTrans){
-    originalSegments = data._origSegments;
-    translatedSegments = data._translatedSegments;
-    /* 当前显示的是译文还是原文：看第一段和译文第一段是否一致 */
-    showingTranslation = (data.segments && data.segments.length && data.segments[0]
-      && translatedSegments[0] && data.segments[0].text === translatedSegments[0].text);
-  } else {
-    originalSegments = null;
-    translatedSegments = null;
-    showingTranslation = false;
-  }
+  /* 每份新结果都从原文开始显示；之前存过译文的，点按钮可直接切过去不用再请求 */
+  showingTranslated = false;
+  translating = false;
+  translatedSegments = Array.isArray(data.translatedSegments) ? data.translatedSegments : null;
+  translatedTranscript = data.translatedTranscript || '';
+  currentIsEnglish = isEnglishResult(data);
+  updateTranslateBtn();
   var segments = Array.isArray(data.segments) ? data.segments : [];
   var title = data.title || '未命名视频';
 
@@ -813,7 +1161,6 @@ function renderResult(data, url, opts){
   document.getElementById('result-label').textContent = '字幕结果 · 共 ' + (segments.length ? segments.length + ' 段' : '全文');
 
   renderLines(data);
-  updateTranslateBtn();
 
   /* 结果下面的小字：校对改了几处、校对有没有跑成、各阶段用时（后端给了才显示） */
   var note = document.getElementById('proofread-note');
@@ -842,19 +1189,27 @@ function renderResult(data, url, opts){
 /* ---------- 复制 / 下载 / 总结（都基于真实转写结果） ---------- */
 function fullText(){
   if(!lastResult) return '';
+  var disp = displayData();
   if(!showTimestamps){
-    var segs = lastResult.segments || [];
+    var segs = disp.segments || [];
     if(segs.length) return segs.map(function(s){ return s.text || ''; }).join('\n');
-    return lastResult.transcript || '';
+    return disp.transcript || '';
   }
-  if(lastResult.transcript) return lastResult.transcript;
-  return (lastResult.segments || []).map(function(s){ return '[' + fmtTime(s.start) + '] ' + (s.text || ''); }).join('\n');
+  /* 显示译文时没有现成的整段 transcript 拼接逻辑差异：有分段就按分段拼，保证复制的是当前显示版 */
+  if(showingTranslated){
+    var tsegs = disp.segments || [];
+    if(tsegs.length) return tsegs.map(function(s){ return '[' + fmtTime(s.start) + '] ' + (s.text || ''); }).join('\n');
+    return disp.transcript || '';
+  }
+  if(disp.transcript) return disp.transcript;
+  return (disp.segments || []).map(function(s){ return '[' + fmtTime(s.start) + '] ' + (s.text || ''); }).join('\n');
 }
 function timedText(){
   if(!lastResult) return '';
-  var segs = lastResult.segments || [];
+  var disp = displayData();
+  var segs = disp.segments || [];
   if(segs.length) return segs.map(function(s){ return showTimestamps ? ('[' + fmtTime(s.start) + '] ' + (s.text || '')) : (s.text || ''); }).join('\n');
-  return lastResult.transcript || '';
+  return disp.transcript || '';
 }
 function copyAll(){
   if(!lastResult){ toast('还没有转写结果'); return; }
@@ -900,11 +1255,12 @@ function downloadTxt(){
 /* 简单三句总结：从真实字幕里挑开头、中间、结尾的代表句，不编内容 */
 function showSummary(){
   if(!lastResult){ toast('先转出字幕再总结'); return; }
+  var disp = displayData();
   var texts = [];
-  if(lastResult.segments && lastResult.segments.length){
-    texts = lastResult.segments.map(function(s){ return (s.text || '').trim(); }).filter(Boolean);
-  } else if(lastResult.transcript){
-    texts = lastResult.transcript.split(/[。！？\n]+/).map(function(s){ return s.trim(); }).filter(Boolean);
+  if(disp.segments && disp.segments.length){
+    texts = disp.segments.map(function(s){ return (s.text || '').trim(); }).filter(Boolean);
+  } else if(disp.transcript){
+    texts = disp.transcript.split(/[。！？\n]+/).map(function(s){ return s.trim(); }).filter(Boolean);
   }
   if(!texts.length){ toast('字幕是空的，没法总结'); return; }
   var picks;
@@ -912,259 +1268,6 @@ function showSummary(){
   else { picks = [texts[0], texts[Math.floor(texts.length / 2)], texts[texts.length - 1]]; }
   document.getElementById('summary-text').textContent = picks.join(' ');
   document.getElementById('summary-box').classList.add('show');
-}
-
-/* ---------- 翻译成中文：只有英文结果才显示按钮；正文内容优先判断 ----------
-   按钮逻辑：英文结果显示“翻译成中文”；点后先试一次后端 /translate，通了用它，
-   不通改走页面直连（Google gtx 批量 → MyMemory 批量，整批对不齐逐段补翻），
-   时间点不变；翻译后按钮变成“查看原文”，再点切回英文原文。
-   原文和译文都缓存下来，原文↔中文来回切只是换显示，不用重新翻译。 */
-var showingTranslation = false;
-var originalSegments = null;  /* 英文原文段 */
-var translatedSegments = null;  /* 中文译文段：翻过一次就缓存，切回来不用重翻 */
-function isEnglishResult(data){
-  var text = '';
-  if(data){
-    if(Array.isArray(data.segments) && data.segments.length){
-      text = data.segments.map(function(s){ return s.text || ''; }).join(' ');
-    } else if(typeof data.transcript === 'string'){
-      text = data.transcript;
-    }
-  }
-  var latin = (text.match(/[A-Za-z]/g) || []).length;
-  var cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  /* 正文够长时只看内容：拉丁字母占主导就是英文 */
-  if(latin + cjk >= 20){
-    return latin > cjk * 2;
-  }
-  /* 正文太短才参考后端给的 language */
-  if(data && data.language){
-    var lang = String(data.language).toLowerCase();
-    if(lang === 'en' || lang.indexOf('en') === 0) return true;
-    if(lang === 'zh' || lang.indexOf('zh') === 0) return false;
-  }
-  return latin > 10;
-}
-function updateTranslateBtn(){
-  var btn = document.getElementById('translate-btn');
-  if(!btn) return;
-  if(showingTranslation){
-    btn.style.display = '';
-    btn.textContent = '查看原文';
-    return;
-  }
-  /* 已翻过：按钮是“查看中文”，点一下直接换显示，不用重新翻译 */
-  if(translatedSegments && translatedSegments.length){
-    btn.style.display = '';
-    btn.textContent = '查看中文';
-    return;
-  }
-  if(lastResult && isEnglishResult(lastResult)){
-    btn.style.display = '';
-    btn.textContent = '翻译成中文';
-  } else {
-    btn.style.display = 'none';
-  }
-}
-/* Google gtx 免费翻译（无 key）：批量传多个 q，返回 data[0][i][0] 是第 i 段译文 */
-function gtxBatch(texts){
-  var url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t';
-  texts.forEach(function(t){ url += '&q=' + encodeURIComponent(t); });
-  return fetch(url).then(function(res){
-    if(!res.ok) throw new Error('gtx ' + res.status);
-    return res.json();
-  }).then(function(data){
-    var arr = (data && data[0]) || [];
-    var out = [];
-    for(var i = 0; i < texts.length; i++){
-      var seg = arr[i];
-      out.push(seg && seg[0] ? seg[0] : null);
-    }
-    return out;
-  });
-}
-function gtxOne(text){
-  return gtxBatch([text]).then(function(out){ return out[0]; });
-}
-/* MyMemory 免费翻译（无 key）：单段 */
-function myMemoryOne(text){
-  var url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=en|zh-CN';
-  return fetch(url).then(function(res){
-    if(!res.ok) throw new Error('mymemory ' + res.status);
-    return res.json();
-  }).then(function(data){
-    var t = data && data.responseData && data.responseData.translatedText;
-    if(!t || /QUERY LENGTH LIMIT/i.test(t) || /MYMEMORY WARNING/i.test(t)) throw new Error('mymemory empty');
-    return t;
-  });
-}
-/* 客户端直连翻译：Google gtx 批量 → MyMemory 批量（分隔符合并一次翻）→ 逐段补翻 */
-function translateTextsClientSide(texts){
-  var SEP = '\n@@SEG@@\n';
-  function aligned(out){ return Array.isArray(out) && out.length === texts.length && out.every(function(t){ return typeof t === 'string' && t.length > 0; }); }
-  return gtxBatch(texts).then(function(out){
-    if(aligned(out)) return out;
-    throw new Error('gtx batch misaligned');
-  }).catch(function(){
-    var joined = texts.join(SEP);
-    return myMemoryOne(joined).then(function(t){
-      var parts = t.split(SEP);
-      if(parts.length === texts.length) return parts;
-      throw new Error('mymemory batch misaligned');
-    });
-  }).catch(function(){
-    var jobs = texts.map(function(t){
-      return gtxOne(t).catch(function(){ return myMemoryOne(t); }).catch(function(){ return t; });
-    });
-    return Promise.all(jobs);
-  });
-}
-/* 在历史记录里找当前这条视频存过的译文：按链接匹配，链接没有就按标题+时长匹配。
-   找不到返回 null。 */
-function findHistoryTranslation(){
-  if(!lastResult) return null;
-  var url = lastResult.url || '';
-  var title = lastResult.title || '';
-  var dur = lastResult.duration;
-  var list = loadHistory();
-  for(var i = 0; i < list.length; i++){
-    var rec = list[i];
-    if(!rec || !Array.isArray(rec._translatedSegments) || !rec._translatedSegments.length) continue;
-    if(url && rec.url && rec.url === url) return rec._translatedSegments;
-    if(!url && title && rec.title === title && rec.duration === dur) return rec._translatedSegments;
-    /* 兜底：链接和标题都对不上时，按第一段原文内容匹配 */
-    if(rec._origSegments && rec._origSegments.length && lastResult.segments && lastResult.segments.length
-      && rec._origSegments[0].text === lastResult.segments[0].text
-      && rec._origSegments.length === lastResult.segments.length){
-      return rec._translatedSegments;
-    }
-  }
-  return null;
-}
-/* 把带译文的上次结果可靠地存下来：写完读回验证；本地空间不够时，先清掉历史里
-   旧记录的译文腾地方，再存；还是存不下就放弃，不让页面报错。 */
-function saveTranslationReliably(){
-  if(!lastResult) return;
-  var payload = JSON.stringify(lastResult);
-  try {
-    window.localStorage.setItem(LS_RESULT, payload);
-    if(window.localStorage.getItem(LS_RESULT) === payload) return;
-  } catch(e) {}
-  /* 写满了或没写进去：清历史旧记录的译文腾地方，再试一次 */
-  try {
-    var list = loadHistory();
-    var changed = false;
-    list.forEach(function(rec){
-      if(rec && rec._translatedSegments){ delete rec._translatedSegments; changed = true; }
-      if(rec && rec._origSegments){ delete rec._origSegments; changed = true; }
-    });
-    if(changed) saveHistoryList(list);
-    window.localStorage.setItem(LS_RESULT, payload);
-  } catch(e) {}
-}
-async function toggleTranslate(){
-  if(!lastResult){ toast('还没有转写结果'); return; }
-  var btn = document.getElementById('translate-btn');
-  /* 正在看译文：切回原文。译文缓存留着，再切回中文不用重翻 */
-  if(showingTranslation){
-    if(originalSegments){
-      lastResult.segments = originalSegments;
-      lastResult.transcript = originalSegments.map(function(s){ return s.text || ''; }).join('\n');
-    }
-    showingTranslation = false;
-    renderLines(lastResult);
-    updateTranslateBtn();
-    try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
-    return;
-  }
-  /* 已经翻过：直接换上缓存的译文，不用重新翻译 */
-  if(translatedSegments && translatedSegments.length){
-    lastResult.segments = translatedSegments;
-    lastResult.transcript = translatedSegments.map(function(s){ return s.text || ''; }).join('\n');
-    showingTranslation = true;
-    renderLines(lastResult);
-    updateTranslateBtn();
-    try { storeSet(LS_RESULT, JSON.stringify(lastResult)); } catch(e) {}
-    return;
-  }
-  /* 译文只存在历史那份拷贝里（上次结果那份没有）：先把它捡回来直接显示，不用重翻。
-     按链接匹配，链接没有就按标题+时长匹配。 */
-  var histTrans = findHistoryTranslation();
-  if(histTrans){
-    originalSegments = lastResult.segments.map(function(s){ return { start: s.start, end: s.end, text: s.text }; });
-    translatedSegments = histTrans;
-    lastResult._origSegments = originalSegments;
-    lastResult._translatedSegments = translatedSegments;
-    lastResult.segments = translatedSegments;
-    lastResult.transcript = translatedSegments.map(function(s){ return s.text || ''; }).join('\n');
-    showingTranslation = true;
-    renderLines(lastResult);
-    updateTranslateBtn();
-    saveTranslationReliably();
-    return;
-  }
-  var segs = lastResult.segments || [];
-  if(!segs.length){ toast('这条没有分段，没法翻译'); return; }
-  if(btn) btn.textContent = '翻译中…';
-  var translated = null;
-  /* 先试一次后端 /translate，通了优先用它 */
-  try {
-    var res = await fetch(API_BASE + '/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ segments: segs.map(function(s){ return { start: s.start, end: s.end, text: s.text }; }) })
-    });
-    if(res.ok){
-      var data = await res.json();
-      var arr = data.segments || data.result || null;
-      if(Array.isArray(arr) && arr.length === segs.length){
-        translated = arr.map(function(s){ return s.text || ''; });
-      }
-    }
-  } catch(e) { /* 后端不可用就走客户端直连 */ }
-  if(!translated){
-    try {
-      translated = await translateTextsClientSide(segs.map(function(s){ return s.text || ''; }));
-    } catch(e) { translated = null; }
-  }
-  if(!translated || !translated.length){
-    toast('翻译服务暂不可用，稍后再试');
-    updateTranslateBtn();
-    return;
-  }
-  /* 原文和译文都存下来：原文存 _origSegments，译文存 _translatedSegments，
-     刷新后也能切回，原文↔中文来回切都不用重新翻译 */
-  originalSegments = segs.map(function(s){ return { start: s.start, end: s.end, text: s.text }; });
-  translatedSegments = segs.map(function(s, i){
-    return { start: s.start, end: s.end, text: translated[i] || s.text };
-  });
-  lastResult._origSegments = originalSegments;
-  lastResult._translatedSegments = translatedSegments;
-  lastResult.segments = translatedSegments;
-  lastResult.transcript = translatedSegments.map(function(s){ return s.text; }).join('\n');
-  showingTranslation = true;
-  renderLines(lastResult);
-  updateTranslateBtn();
-  saveTranslationReliably();
-  /* 译文也写回历史里那条记录，下次从历史打开还能直接切中文 */
-  try {
-    var hist = loadHistory();
-    var matched = false;
-    hist.forEach(function(rec){
-      if(!rec) return;
-      var sameUrl = lastResult.url && rec.url && rec.url === lastResult.url;
-      var sameTitle = !lastResult.url && rec.title === lastResult.title && rec.duration === lastResult.duration;
-      var sameFirst = rec.segments && rec.segments.length && lastResult.segments.length
-        && rec.segments[0].text === translatedSegments[0].text;
-      if(sameUrl || sameTitle || sameFirst){
-        rec._origSegments = originalSegments;
-        rec._translatedSegments = translatedSegments;
-        matched = true;
-      }
-    });
-    if(matched) saveHistoryList(hist);
-  } catch(e) {}
-  toast('已翻译成中文');
 }
 
 /* ---------- 刷新恢复：接着跑没跑完的任务，或直接显示上次的结果 ---------- */
@@ -1186,9 +1289,10 @@ async function resumeJob(job){
   try {
     var data = await pollJob(job.jobId, deadline);
     clearPendingJob();
-    pushHistory(saveResult(data, job.url || ''));
+    var rec = saveResult(data, job.url || '');
+    pushHistory(rec);
     finishProgress();
-    renderResult(data, job.url || '');
+    renderResult(rec, job.url || '');
     cta.disabled = false; cta.textContent = '再转一遍';
     running = false;
   } catch(err) {
@@ -1206,7 +1310,7 @@ async function resumeJob(job){
 }
 function restoreOnLoad(){
   applyTsSwitch();
-  applyAnnotateSwitch();
+  applyPunctSwitch();
   /* 历史迁移：本地已经存着的上次结果，作为历史里的第一条 */
   var lastSaved = null;
   try { lastSaved = JSON.parse(storeGet(LS_RESULT) || 'null'); } catch(e) {}
