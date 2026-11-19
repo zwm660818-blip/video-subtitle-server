@@ -22,7 +22,7 @@
 
 ## 流程
 
-1. 解析链接：`GET https://video.zacao.top/api/parse/v2?url=<链接>`（不用 key，抖音和快手都实测过），取 `data.source_video_url`。
+1. 解析链接：`GET https://video.zacao.top/api/parse/v2?url=<链接>`（不用 key，抖音和快手都实测过），取 `data.source_video_url`。zacao 和 hk0.cc **同时发起**，哪家先返回就先开始下载，后到的那家作为下载失败时的备用（以前是一家一家串行，每家最多等 60 秒，一家卡住就白等一分钟）。日志里 `[parse] zacao ok 3.2s` 能看到每家用时；任务结果里的 `timings`（解析/下载/音频/转写/校对各多少秒）会显示在页面结果下方，日志里是 `[timing] ...`。
 2. 下载视频：Chrome UA，抖音再加 `Referer: https://www.douyin.com/`。解析会收集 zacao 和 hk0.cc 两家给的全部候选地址（不同 CDN 主机），逐个试：连不上（`[Errno 101] Network is unreachable`、拒绝连接、连接超时）的地址立刻放弃换下一个，不重试；下载到一半断流的才用 Range 续传。全部失败后重新解析一次（CDN 主机和签名每次解析都会变），用新地址再试一轮。全失败时错误信息里会列出每个地址的主机名和它解析到几个 IPv4/IPv6 地址（`v26.xxx（IPv4×0，IPv6×2） 连不上: ...`），同样的内容也会打印到容器日志（`[download] fail ...`），排查时先看这个：IPv4×0 说明这台 CDN 主机只有 IPv6，SnapDeploy 容器连不上。
 3. `ffprobe` 读时长，`ffmpeg` 提音频为 128k mp3（约 1 MB/分钟）。
 4. Groq 转写：`POST https://api.groq.com/openai/v1/audio/transcriptions`，`verbose_json`（带时间戳）。**必须发浏览器 UA**，否则 Cloudflare 拦 403（error 1010）。

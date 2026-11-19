@@ -81,6 +81,10 @@
   .summary-box b{ display:block; font-size:12px; color:#6b7280; margin-bottom:6px; letter-spacing:.02em; }
   .proofread-note{ display:none; margin-top:10px; font-size:12.5px; color:#9ca3af; }
   .proofread-note.show{ display:block; }
+  .srv-status{ display:none; margin:0 4px 8px; font-size:12.5px; color:#6b7280; line-height:1.5; }
+  .srv-status.show{ display:block; }
+  .srv-status::before{ content:''; display:inline-block; width:7px; height:7px; border-radius:999px; background:#f59e0b; margin-right:6px; vertical-align:1px; }
+  .srv-status.ready::before{ background:#16a34a; }
 
   .hist{ font-size:13px; }
   .hist-row{ display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid #eef0f2; cursor:pointer; }
@@ -132,6 +136,7 @@
     <div class="a-row"><span>英文词加中文释义</span><button class="switch on" id="annotate-switch" onclick="toggleAnnotate()" aria-label="英文词加中文释义开关"></button></div>
   </div>
 
+  <div class="srv-status" id="srv-status"></div>
   <button class="a-cta" id="cta" onclick="runTranscribe()">开始转字幕</button>
 
   <div class="a-card steps" id="steps">
@@ -172,10 +177,11 @@
 <script>
 var API_BASE = 'https://video-subtitle-server-db002.containers.snapdeploy.app';
 var TIMEOUT_MS = 15 * 60 * 1000; /* 总超时 15 分钟：唤醒 + 提交任务 + 轮询等结果，长视频校对也要时间 */
-var POLL_MS = 5000;              /* 每 5 秒查一次任务进度 */
+var POLL_MS = 2000;              /* 每 2 秒查一次任务进度（任务接口很轻，越密越早看到结果） */
 var WAKE_URL = 'https://snapdeploy.dev/api/public/wake/video-subtitle-server-db002'; /* 唤醒接口：只有调它才能把睡着的服务器叫醒，503 唤醒页叫不醒 */
-var HEALTH_POLL_MS = 5000;       /* 叫醒后每 5 秒查一次 /health，确认服务器真的醒了 */
-var WAKE_WAIT_MS = 2 * 60 * 1000; /* 等服务器醒最多等 2 分钟 */
+var HEALTH_POLL_MS = 2000;       /* 叫醒后每 2 秒查一次 /health，确认服务器真的醒了 */
+var WAKE_WAIT_MS = 3 * 60 * 1000; /* 等服务器醒最多等 3 分钟 */
+var AWAKE_FRESH_MS = 5 * 60 * 1000; /* 5 分钟内确认过服务器醒着，点开始就直接提交 */
 
 var currentMode = 'accurate';
 var lastResult = null;   /* { title, duration, transcript, segments } */
@@ -348,11 +354,74 @@ function setMode(mode){
   btns.forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-mode') === mode); });
 }
 
-/* 页面一打开就调一次唤醒接口，让服务器提前醒过来（不用等结果，失败也无所谓） */
-(function wakeUp(){
-  try {
-    fetch(WAKE_URL, { method: 'POST' }).then(function(){}, function(){});
-  } catch(e) {}
+/* ---------- 服务器唤醒：页面一打开就开始，不等用户点开始 ----------
+   带超时的 fetch：服务器睡着时请求可能一直挂着，不设超时就会无限等 */
+function fetchT(url, opts, ms){
+  var o = opts || {};
+  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = null;
+  if(ctrl){ o.signal = ctrl.signal; timer = setTimeout(function(){ ctrl.abort(); }, ms); }
+  return fetch(url, o).then(
+    function(r){ if(timer) clearTimeout(timer); return r; },
+    function(e){ if(timer) clearTimeout(timer); throw e; }
+  );
+}
+var serverAwakeAt = 0;   /* 最近一次确认服务器醒着的时间 */
+function checkHealth(){
+  return fetchT(API_BASE + '/health', { method: 'GET' }, 4000).then(function(res){
+    if(res.status === 200){ serverAwakeAt = Date.now(); return true; }
+    return false;
+  }, function(){ return false; });
+}
+function setSrvStatus(state){
+  var el = document.getElementById('srv-status');
+  if(!el) return;
+  if(state === 'ready'){ el.className = 'srv-status show ready'; el.textContent = '服务器已就绪，可以直接转'; }
+  else if(state === 'waking'){ el.className = 'srv-status show'; el.textContent = '服务器正在唤醒（最久约 1～2 分钟），可以先粘贴链接'; }
+  else if(state === 'slow'){ el.className = 'srv-status show'; el.textContent = '服务器还没醒过来，点开始后会继续等它'; }
+  else { el.className = 'srv-status'; el.textContent = ''; }
+}
+/* 唤醒过程：同一时间只跑一个（页面预热和点开始共用）。先调唤醒接口，之后每 15 秒再调一次
+   （防止第一次被丢），每 2 秒查一次 /health（4 秒超时），一返回 200 立刻结束 */
+var wakeLoop = null;
+function wakeServer(maxMs){
+  if(wakeLoop) return wakeLoop;
+  wakeLoop = (async function(){
+    var end = Date.now() + maxMs, lastWake = 0;
+    try {
+      while(Date.now() < end){
+        if(Date.now() - lastWake > 15000){
+          lastWake = Date.now();
+          try { await fetchT(WAKE_URL, { method: 'POST' }, 8000); } catch(e) {}
+        }
+        if(await checkHealth()) return true;
+        await sleepMs(HEALTH_POLL_MS);
+      }
+      return false;
+    } finally { wakeLoop = null; }
+  })();
+  return wakeLoop;
+}
+function prewake(){
+  setSrvStatus('waking');
+  wakeServer(WAKE_WAIT_MS).then(function(ok){ setSrvStatus(ok ? 'ready' : 'slow'); });
+}
+(function initWake(){
+  /* 先问一声 /health：醒着就不用调唤醒接口；没醒再走唤醒过程 */
+  checkHealth().then(function(ok){ if(ok) setSrvStatus('ready'); else prewake(); });
+  /* 页面开着（可见）时每 4 分钟问一次 /health，别让服务器因 15 分钟没人用而睡着；
+     页面在后台或关掉就不问了，不白占服务器的免费时长 */
+  setInterval(function(){
+    if(document.hidden || running) return;
+    checkHealth().then(function(ok){ if(ok) setSrvStatus('ready'); else prewake(); });
+  }, 4 * 60 * 1000);
+  /* 切回页面时，如果已经有一阵没确认过服务器醒着，马上确认一下，睡了就提前叫醒 */
+  document.addEventListener('visibilitychange', function(){
+    if(document.hidden || running) return;
+    if(Date.now() - serverAwakeAt > AWAKE_FRESH_MS){
+      checkHealth().then(function(ok){ if(ok) setSrvStatus('ready'); else prewake(); });
+    }
+  });
 })();
 
 /* ---------- 小工具 ---------- */
@@ -363,6 +432,15 @@ function fmtTime(sec){
   var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
   function pad(n){ return (n < 10 ? '0' : '') + n; }
   return h > 0 ? (h + ':' + pad(m) + ':' + pad(r)) : (pad(m) + ':' + pad(r));
+}
+function fmtTimings(t){
+  if(!t || typeof t !== 'object') return '';
+  var names = { parse:'解析', download:'下载', audio:'音频', transcribe:'转写', proofread:'校对' };
+  var out = [];
+  Object.keys(names).forEach(function(k){
+    if(typeof t[k] === 'number') out.push(names[k] + ' ' + Math.round(t[k]) + ' 秒');
+  });
+  return out.length ? ('用时：' + out.join(' · ')) : '';
 }
 function fmtDuration(dur){
   if(dur === null || dur === undefined || dur === '') return '';
@@ -513,11 +591,11 @@ function hideError(){ document.getElementById('err-box').classList.remove('show'
    再每 5 秒查一次 GET /health，返回 200 确认醒了才正式提交；最多等 2 分钟，等不到就报错
    全程总超时 15 分钟 */
 function postJob(url){
-  return fetch(API_BASE + '/transcribe', {
+  return fetchT(API_BASE + '/transcribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url: url, mode: currentMode, annotate: annotateEnglish })
-  }).then(function(res){
+  }, 30000).then(function(res){
     return res.text().then(function(text){
       var data = null;
       try { data = JSON.parse(text); } catch(e) {}
@@ -539,33 +617,30 @@ function jobIdFrom(out){
   }
   throw { plain: '服务器收下了链接，但没给任务编号，没法查进度。等一会儿再试一次。', raw: out.text ? out.text.slice(0, 200) : '' };
 }
-/* 先调唤醒接口把服务器叫醒，再每 5 秒查一次 /health，返回 200 才算真醒了；最多等 2 分钟 */
+/* 点开始时的等待：和页面预热共用同一个唤醒过程（最多 3 分钟，一返回 200 立刻结束） */
 async function wakeAndWait(deadline){
   document.getElementById('wake-note').classList.add('show');
-  try { await fetch(WAKE_URL, { method: 'POST' }); } catch(e) {}
-  var end = Math.min(Date.now() + WAKE_WAIT_MS, deadline);
-  while(Date.now() < end){
-    try {
-      var res = await fetch(API_BASE + '/health', { method: 'GET' });
-      if(res.status === 200) return true;
-    } catch(e) {}
-    if(Date.now() + HEALTH_POLL_MS >= end) break;
-    await sleepMs(HEALTH_POLL_MS);
-  }
-  return false;
+  var ms = Math.max(1000, Math.min(WAKE_WAIT_MS, deadline - Date.now()));
+  var ok = await wakeServer(ms);
+  setSrvStatus(ok ? 'ready' : 'slow');
+  return ok;
 }
 async function submitJob(url, deadline){
   var out = null;
-  try { out = await postJob(url); } catch(e) { out = null; }
-  if(out && out.data) return jobIdFrom(out);
-  /* 没拿到 JSON：多半是服务器睡着了（503 唤醒页叫不醒它）。先叫醒、确认醒了，再正式提交 */
+  /* 5 分钟内确认过服务器醒着（页面预热、保活或上一次任务），或者现问一声 /health 返回 200：
+     直接提交，不再走“唤醒服务器”那一步。不再先盲发一个 POST 去碰运气——服务器睡着时那个请求会挂住很久 */
+  if(Date.now() - serverAwakeAt < AWAKE_FRESH_MS || await checkHealth()){
+    try { out = await postJob(url); } catch(e) { out = null; }
+    if(out && out.data) return jobIdFrom(out);
+  }
+  /* 没醒（或者提交没拿到 JSON，多半是刚好睡着了）：叫醒、确认醒了，再正式提交 */
   var awake = await wakeAndWait(deadline);
   if(awake){
     var out2 = null;
     try { out2 = await postJob(url); } catch(e) { out2 = null; }
     if(out2 && out2.data) return jobIdFrom(out2);
   }
-  throw { plain: '服务器一直没醒过来，等一两分钟再点一次开始。', raw: '已调唤醒接口并等了 2 分钟，服务器都没正常回应' };
+  throw { plain: '服务器一直没醒过来，等一两分钟再点一次开始。', raw: '已调唤醒接口并等了 3 分钟，服务器都没正常回应' };
 }
 async function pollJob(jobId, deadline){
   var first = true;
@@ -577,7 +652,7 @@ async function pollJob(jobId, deadline){
     }
     var out = null;
     try {
-      var res = await fetch(API_BASE + '/jobs/' + encodeURIComponent(jobId), { method: 'GET' });
+      var res = await fetchT(API_BASE + '/jobs/' + encodeURIComponent(jobId), { method: 'GET' }, 15000);
       var text = await res.text();
       var data = null;
       try { data = JSON.parse(text); } catch(e) {}
@@ -591,6 +666,7 @@ async function pollJob(jobId, deadline){
       /* 这一轮没查到（服务器打盹或网络抖动），下一轮接着查，直到总超时 */
       continue;
     }
+    serverAwakeAt = Date.now();
     var d = out.data;
     var status = String(d.status || '').toLowerCase();
     if(status === 'done' || status === 'success' || status === 'completed'){
@@ -717,16 +793,18 @@ function renderResult(data, url, opts){
   renderLines(data);
   updateTranslateBtn();
 
-  /* 校对改了几行：后端给了才显示，没给就不显示 */
+  /* 结果下面的小字：校对改了几处、校对有没有跑成、各阶段用时（后端给了才显示） */
   var note = document.getElementById('proofread-note');
-  var changed = (data.proofread && typeof data.proofread.changed === 'number') ? data.proofread.changed : null;
-  if(changed !== null && changed > 0){
-    note.textContent = '校对改了 ' + changed + ' 处';
-    note.classList.add('show');
-  } else {
-    note.textContent = '';
-    note.classList.remove('show');
-  }
+  var pr = data.proofread || {};
+  var changed = (typeof pr.changed === 'number') ? pr.changed : 0;
+  var failedBatches = (typeof pr.failed === 'number') ? pr.failed : 0;
+  var parts = [];
+  if(changed > 0) parts.push('校对改了 ' + changed + ' 处');
+  if(failedBatches > 0) parts.push('有 ' + failedBatches + ' 批校对没跑成（多半是转写服务限流），可能还有错字，过几分钟重转一次更准');
+  var tm = fmtTimings(data.timings);
+  if(tm) parts.push(tm);
+  note.textContent = parts.join('；');
+  note.classList.toggle('show', parts.length > 0);
 
   document.getElementById('summary-box').classList.remove('show');
   var result = document.getElementById('result');

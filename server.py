@@ -14,6 +14,7 @@ No secret is stored in this code.
 
 import json
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -88,6 +89,10 @@ PROOFREAD_SYSTEM = (
     "讲学习、看辩论、长见识的语境里，“找脑子”应为“长脑子”"
     "（长和找发音接近，Whisper 常把“长脑子”听成“找脑子”，"
     "而“找脑子”字面是“寻找脑子”，讲不通）；"
+    "口语里常见的固定搭配要特别留意，读起来别扭时按固定搭配修正："
+    "“试错成本”（不是“失落成本”，试和失、错和落音近）、“机会成本”“沉没成本”；"
+    "“跟某人分享/交流”（不是“陪某人分享”）；“如果你想……”（不是“如果你将……”，想和将音近）；"
+    "想/将、跟/陪/和 这几组近音字最容易听混，通读时要留意，按上下文选最通顺的一个；"
     "如果某行里的型号、编号与上面列出的反复出现的型号只差一两个字母，优先按反复出现的那个修正"
     "（例如视频里 CT5 出现多次，某行出现 CP5 很可能是把 T 听成了 P）；"
     "注意中英夹杂：说话人有时会说英文单词，转写可能把英文听成了中文同音字"
@@ -275,44 +280,74 @@ def _parse_via_hk0(url: str) -> tuple[str, str, list[str], bool] | None:
     return video_url, str(title), backups, is_huge
 
 
-def parse_candidates(url: str) -> tuple[str, list[str]]:
-    """Step 1: resolve the short link to ALL direct video URLs we can get.
+PARSERS = [("zacao", _parse_via_zacao), ("hk0", _parse_via_hk0)]
 
-    Runs both parsers (zacao first, hk0.cc second; WeChat reversed) and
-    collects every candidate address, deduplicated, best first. Previously
-    only the first parser's single URL was kept, so when that one CDN host
-    was unreachable from the server (Errno 101 Network is unreachable,
-    2026-11-18 18:26 on a Douyin link) the whole job failed even though
-    the other parser had a working address for the same video.
-    Returns (title, [url, ...])."""
-    is_wechat = "weixin.qq.com" in url or "channels.weixin.qq.com" in url
-    attempts = (
-        [_parse_via_hk0, _parse_via_zacao] if is_wechat
-        else [_parse_via_zacao, _parse_via_hk0]
-    )
-    results = []
-    for fn in attempts:
+
+def stream_candidates(url: str):
+    """Step 1: resolve the link, yielding (title, video_url) AS EACH PARSER
+    FINISHES instead of waiting for all of them.
+
+    Both parsers (zacao and hk0.cc) are started at the same time in
+    background threads. Before, they ran one after the other, each allowed
+    up to 60 s, so one slow or hanging parser cost a full minute before the
+    other was even asked (a 3-minute video spent ~60 s in "parse"). Now the
+    download starts on the first address that arrives; the slower parser's
+    addresses are only waited for if the first ones fail to download (e.g.
+    Errno 101 on an unreachable CDN host), so no time is lost and no
+    fallback is lost either.
+
+    Within one parser's answer the order is: normal address, its backups,
+    and a huge original file (hk0 sometimes returns 751 MB for a 7-minute
+    video) is held back until every parser has reported, so a compressed
+    version from the other parser is preferred.
+    Raises PipelineError("parse") only if NO address came out at all."""
+    results: "queue.Queue[tuple[str, float, tuple | None]]" = queue.Queue()
+
+    def work(name, fn):
+        t0 = time.monotonic()
         try:
             result = fn(url)
         except Exception:
-            # A parser must never crash the job; try the next one.
+            # A parser must never crash the job.
+            result = None
+        results.put((name, time.monotonic() - t0, result))
+
+    for name, fn in PARSERS:
+        threading.Thread(target=work, args=(name, fn), daemon=True).start()
+
+    seen: set[str] = set()
+    deferred: list[tuple[str, str]] = []  # huge originals, tried last
+    yielded = 0
+    for _ in PARSERS:
+        name, took, result = results.get()
+        print(f"[parse] {name} {'ok' if result else 'none'} {took:.1f}s", flush=True)
+        if not result:
             continue
-        if result:
-            results.append(result)
-    if not results:
+        video_url, title, backup_urls, is_huge = result
+        for u in ([] if is_huge else [video_url]) + list(backup_urls):
+            if u and u not in seen:
+                seen.add(u)
+                yielded += 1
+                yield title, u
+        if is_huge and video_url and video_url not in seen:
+            seen.add(video_url)
+            deferred.append((title, video_url))
+    for title, u in deferred:
+        yielded += 1
+        yield title, u
+    if not yielded:
         raise PipelineError("parse", "这个链接解析不出来，换个链接试试")
-    title = results[0][1]
-    primaries: list[str] = []
-    huge_primaries: list[str] = []
-    backups: list[str] = []
-    for video_url, _t, backup_urls, is_huge in results:
-        (huge_primaries if is_huge else primaries).append(video_url)
-        backups.extend(backup_urls)
-    candidates: list[str] = []
-    for u in primaries + backups + huge_primaries:
-        if u and u not in candidates:
-            candidates.append(u)
-    return title, candidates
+
+
+def parse_candidates(url: str) -> tuple[str, list[str]]:
+    """Materialised form of stream_candidates: (title, [url, ...]).
+    Waits for every parser; the pipeline itself uses the stream."""
+    title = ""
+    urls: list[str] = []
+    for t, u in stream_candidates(url):
+        title = title or t
+        urls.append(u)
+    return title, urls
 
 
 def parse_link(url: str) -> tuple[str, str]:
@@ -399,7 +434,7 @@ def download_video(video_url: str, dest: Path) -> None:
     raise PipelineError("download", f"下载中断，重试3次仍失败: {last_exc}")
 
 
-def download_video_any(candidates: list[str], dest: Path) -> str:
+def download_video_any(candidates, dest: Path) -> str:
     """Try each candidate URL in order until one downloads.
 
     A candidate that fails (e.g. its CDN host is unreachable from this
@@ -408,7 +443,9 @@ def download_video_any(candidates: list[str], dest: Path) -> str:
     the existing file size -- resuming a different video's bytes would
     corrupt the file. Returns the URL that worked."""
     failures: list[str] = []
+    tried = 0
     for video_url in candidates:
+        tried += 1
         for suffix in ("", ".part0", ".part1", ".part2", ".part3"):
             try:
                 (dest.with_suffix(suffix) if suffix else dest).unlink(missing_ok=True)
@@ -434,7 +471,7 @@ def download_video_any(candidates: list[str], dest: Path) -> str:
         raise PipelineError("download", "没有可用的下载地址")
     raise PipelineError(
         "download",
-        f"视频下载失败，试了{len(candidates)}个地址都不行，请过一会儿再试。详情：" + "；".join(failures[:4]),
+        f"视频下载失败，试了{tried}个地址都不行，请过一会儿再试。详情：" + "；".join(failures[:4]),
     )
 
 
@@ -455,9 +492,9 @@ def _describe_host(video_url: str) -> str:
     return f"{host}（IPv4×{v4}，IPv6×{v6}）"
 
 
-def download_with_reparse(url: str, candidates: list[str], dest: Path) -> str:
-    """Download from the candidates; if every one fails, parse the link again
-    and try the fresh addresses once more.
+def download_with_reparse(url: str, candidates, dest: Path) -> str:
+    """Download from the candidates (a list or a lazy stream); if every one
+    fails, parse the link again and try the fresh addresses once more.
 
     The CDN hosts and signed URLs change with every parse (e.g.
     v11/v13-default.365yg.com), so a second parse often yields an address
@@ -465,17 +502,17 @@ def download_with_reparse(url: str, candidates: list[str], dest: Path) -> str:
     try:
         return download_video_any(candidates, dest)
     except PipelineError as first:
-        try:
-            _title, fresh = parse_candidates(url)
-        except PipelineError:
-            raise first
-        # Addresses we have not tried come first, then re-tries of the old
-        # ones from the new parse (their signed URLs differ).
-        retry = [u for u in fresh if u not in candidates] + [u for u in fresh if u in candidates]
-        if not retry:
-            raise first
+        if first.step == "parse":
+            # Nothing could be parsed at all (not a download failure): a
+            # second parse would only cost another wait.
+            raise
         time.sleep(3)
-        return download_video_any(retry, dest)
+        try:
+            return download_video_any((u for _t, u in stream_candidates(url)), dest)
+        except PipelineError as second:
+            if second.step == "parse":
+                raise first
+            raise
 
 
 def _download_parallel(video_url: str, dest: Path, total: int, headers: dict) -> None:
@@ -728,11 +765,14 @@ def _proofread_batch(
     anchors: str = "",
     system: str = PROOFREAD_SYSTEM,
     extra_chars: int = 20,
-) -> dict[int, str]:
+) -> dict[int, str] | None:
     """Proofread one batch; returns {1-based index: corrected text}.
 
-    Returns only the lines the model changed (sparse output). On any failure
-    returns {} (caller keeps the originals). Retries on 429: the free tier
+    Returns only the lines the model changed (sparse output); {} means the
+    model ran and found nothing to change. On any failure returns None (the
+    caller keeps the originals AND counts the batch as failed, so the page
+    can say the proofreading did not run instead of silently showing
+    uncorrected text). Retries on 429: the free tier
     for this model allows only 8000 tokens/min, so a long video's batches
     will hit the limit -- wait out the minute window and try again.
 
@@ -767,7 +807,7 @@ def _proofread_batch(
                 timeout=httpx.Timeout(120.0, connect=10.0),
             )
         except Exception:
-            return {}
+            return None
         if resp.status_code == 429:
             wait = 65
             try:
@@ -779,13 +819,13 @@ def _proofread_batch(
             if attempt < 3:
                 time.sleep(wait)
                 continue
-            return {}
+            return None
         if resp.status_code != 200:
-            return {}
+            return None
         try:
             content = resp.json()["choices"][0]["message"]["content"]
         except Exception:
-            return {}
+            return None
         parsed: dict[int, str] = {}
         for line in content.strip().splitlines():
             line = line.strip().strip("`").strip()
@@ -805,7 +845,7 @@ def _proofread_batch(
                 continue
             parsed[idx] = text
         return parsed
-    return {}
+    return None
 
 
 # Deterministic fixed-phrase corrections, applied after the LLM proofreader.
@@ -819,6 +859,22 @@ def _proofread_batch(
 FIXED_PHRASES = {
     "找脑子": "长脑子",
 }
+# Regex rules for the same kind of trap, where the wrong form varies.
+# Reported 2026-11-19 on a "advice for young people" video, all three missed
+# by the LLM proofreader in "accurate" mode:
+# - "失落成本" -> "试错成本": 试(shi)错(cuo) heard as 失(shi)落(luo); "失落成本"
+#   is not a phrase anyone says, "试错成本" is the standard one. The other
+#   variants (实错/是错/使错/失错成本) are the same mishearing.
+# - "陪他们分享" -> "跟他们分享": 跟(gen) heard as 陪(pei). "陪" + 分享/交流/聊聊
+#   directly after the person word is unnatural; "陪他们一起分享" has 一起
+#   in between so it is left alone.
+# - "如果你将给年轻人" -> "如果你想给年轻人": 想(xiang) heard as 将(jiang) right
+#   after 如果/要是/假如 + 你, before 给/跟.
+FIXED_PATTERNS = [
+    (re.compile(r"(?:失落|失错|实错|是错|使错)成本"), "试错成本"),
+    (re.compile(r"陪(他们|她们|你们|大家|我们|你|他|她)(分享|交流|聊聊|聊一聊)"), r"跟\1\2"),
+    (re.compile(r"(如果|要是|假如|假设)你将(给|跟)"), r"\1你想\2"),
+]
 
 
 def _apply_fixed_phrases(segments: list[dict]) -> int:
@@ -829,6 +885,8 @@ def _apply_fixed_phrases(segments: list[dict]) -> int:
         new_text = text
         for wrong, right in FIXED_PHRASES.items():
             new_text = new_text.replace(wrong, right)
+        for pattern, repl in FIXED_PATTERNS:
+            new_text = pattern.sub(repl, new_text)
         if new_text != text:
             seg["text"] = new_text
             changed += 1
@@ -845,10 +903,11 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
     Returns (segments, stats) where stats counts changed lines and batches.
     """
     if not segments:
-        return segments, {"changed": 0, "batches": 0}
+        return segments, {"changed": 0, "batches": 0, "failed": 0}
     fixed = [dict(s) for s in segments]
     changed = 0
     batches = 0
+    failed = 0  # batches where the model call itself failed (429, timeout, bad reply)
     # Anchor terms are computed once over the whole transcript and given to
     # every batch, so a one-off mishearing (CP5) can be caught against the
     # form that recurs (CT5) even when the two never share a batch.
@@ -859,6 +918,12 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
         try:
             parsed = _proofread_batch(batch, title, api_key, anchors)
         except Exception:
+            parsed = None
+        if parsed is None:
+            # Not "nothing to fix": the proofreader did not run on this batch.
+            # Counted so the page can warn that errors may remain.
+            failed += 1
+            print(f"[proofread] batch {batches} failed (model call error / rate limit)", flush=True)
             parsed = {}
         for idx, text in parsed.items():
             if fixed[base + idx - 1]["text"] != text:
@@ -871,7 +936,7 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
         # long video past the ~2 minute proxy ceiling.
         if base + PROOFREAD_BATCH < len(segments):
             time.sleep(2)
-    return fixed, {"changed": changed, "batches": batches}
+    return fixed, {"changed": changed, "batches": batches, "failed": failed}
 
 
 _ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
@@ -958,7 +1023,9 @@ def annotate_segments(segments: list[dict], title: str, api_key: str) -> tuple[l
             )
         except Exception:
             parsed = {}
-        for k, text in parsed.items():
+        # None = the model call failed; for the optional gloss step that just
+        # means no glosses on this batch.
+        for k, text in (parsed or {}).items():
             i = sub_idx[k - 1]
             original = fixed[i].get("text", "")
             if not _only_glosses_added(original, text):
@@ -1034,23 +1101,48 @@ def do_transcribe(
     running this in the background can report real progress: parse, download,
     audio, transcribe, proofread.
     """
+    # Stage marks -> per-stage seconds, returned as "timings" and printed to
+    # the log, so "where did the time go" is a fact, not a guess.
+    marks: list[tuple[str, float]] = []
+
     def stage(name: str):
+        if not marks or marks[-1][0] != name:
+            marks.append((name, time.monotonic()))
         if on_stage is not None:
             try:
                 on_stage(name)
             except Exception:
                 pass
 
+    def timings() -> dict:
+        now = time.monotonic()
+        out: dict[str, float] = {}
+        for i, (name, t0) in enumerate(marks):
+            t1 = marks[i + 1][1] if i + 1 < len(marks) else now
+            out[name] = round(out.get(name, 0.0) + (t1 - t0), 1)
+        return out
+
     model = MODELS.get(mode, MODELS["fast"])
     with tempfile.TemporaryDirectory(prefix="vts-") as tmp:
         tmpdir = Path(tmp)
         stage("parse")
-        title, candidates = parse_candidates(url)
-        stage("download")
+        title_box = {"title": "未命名视频"}
+
+        def candidate_urls():
+            # Lazy: the first address from either parser starts the download
+            # at once; the slower parser is only waited for if needed.
+            for t, u in stream_candidates(url):
+                if not title_box.get("seen"):
+                    title_box["title"] = t
+                    title_box["seen"] = True
+                stage("download")
+                yield u
+
         video_path = tmpdir / "video.mp4"
         # Tries every candidate address; if all fail, re-parses the link for
         # fresh addresses and tries those too.
-        download_with_reparse(url, candidates, video_path)
+        download_with_reparse(url, candidate_urls(), video_path)
+        title = title_box["title"]
         stage("audio")
         duration = probe_duration(video_path)
         audio_path = extract_audio(video_path, tmpdir)
@@ -1086,7 +1178,7 @@ def do_transcribe(
         # Proofread: fix homophone errors from context. Never breaks the
         # transcription itself -- on failure the raw segments are returned.
         stage("proofread")
-        proofread_stats = {"changed": 0, "batches": 0}
+        proofread_stats = {"changed": 0, "batches": 0, "failed": 0}
         if is_chinese:
             try:
                 segments, proofread_stats = proofread_segments(segments, title, api_key)
@@ -1113,6 +1205,8 @@ def do_transcribe(
             # the final guarantee -- it runs after proofreading and annotating.
             for s in segments:
                 s["text"] = _to_simplified(s.get("text", ""))
+        stage_seconds = timings()
+        print(f"[timing] {stage_seconds} total={sum(stage_seconds.values()):.1f}s", flush=True)
         return {
             "title": title,
             "duration": round(duration, 1),
@@ -1120,6 +1214,7 @@ def do_transcribe(
             "transcript": "".join(s["text"] for s in segments),
             "segments": segments,
             "proofread": proofread_stats,
+            "timings": stage_seconds,
         }
 
 
