@@ -928,7 +928,7 @@ def proofread_segments(segments: list[dict], title: str, api_key: str, punctuate
     changed = 0
     batches = 0
     failed = 0  # batches where the model call itself failed (429, timeout, bad reply)
-    system = PROOFREAD_SYSTEM + (PROOFREAD_PUNCT_RULE,) if punctuate else PROOFREAD_SYSTEM
+    system = PROOFREAD_SYSTEM + PROOFREAD_PUNCT_RULE if punctuate else PROOFREAD_SYSTEM
     extra_chars = 60 if punctuate else 20
     max_tokens = 8192 if punctuate else 4096
     # Anchor terms are computed once over the whole transcript and given to
@@ -1208,8 +1208,11 @@ def do_transcribe(
         if is_chinese:
             try:
                 segments, proofread_stats = proofread_segments(segments, title, api_key, punctuate)
-            except Exception:
-                pass
+            except Exception as e:
+                # Never silently swallow this: a crash here looks exactly like
+                # "nothing to fix" (stats 0/0/0) and cost a whole deploy round
+                # in 2026-11-19 when a str+tuple TypeError killed proofreading.
+                print(f"[proofread] crashed, returning raw segments: {type(e).__name__}: {e}", flush=True)
             # Optional: put （中文意思） after English words. Runs after proofreading
             # so misheard English has already been restored. It reuses the
             # "proofread" stage name on purpose: the page only knows the stages
