@@ -106,6 +106,19 @@ PROOFREAD_SYSTEM = (
     "只返回你改动过的行，每行格式“编号. 修正后的文本”；没有改动的行不要返回；"
     "不要输出任何多余内容。"
 )
+# Punctuation rule, appended to the proofread prompt when the page's
+# "自动加标点" switch is on (default). Whisper's Chinese output has almost
+# no punctuation, and the base prompt only says "只改错字", so without this
+# the result is one long unpunctuated wall of text (reported 2026-11-19).
+# The page switch itself used to be a dead button that only toggled its own
+# CSS class and never reached the backend; it is now wired through the
+# /transcribe `punctuate` field.
+PROOFREAD_PUNCT_RULE = (
+    "另外，给文本加上标点符号：按语义断句，短暂停顿用逗号，完整的一句话结束用句号，"
+    "问句用问号，感叹用感叹号，列举或并列的短语之间用顿号；"
+    "只加标点，不要改任何字、不要增删内容、不要改句式；"
+    "没有标点的行也要返回，加了标点就算改动。"
+)
 # English-gloss step: runs AFTER proofreading (so misheard English like 趴 has
 # already been turned back into party) and only on lines that contain English.
 ANNOTATE_BATCH = 60  # lines per LLM call; only English-bearing lines are sent
@@ -765,6 +778,7 @@ def _proofread_batch(
     anchors: str = "",
     system: str = PROOFREAD_SYSTEM,
     extra_chars: int = 20,
+    max_tokens: int = 4096,
 ) -> dict[int, str] | None:
     """Proofread one batch; returns {1-based index: corrected text}.
 
@@ -802,7 +816,7 @@ def _proofread_batch(
                         {"role": "user", "content": user_msg},
                     ],
                     "temperature": 0,
-                    "max_tokens": 4096,
+                    "max_tokens": max_tokens,
                 },
                 timeout=httpx.Timeout(120.0, connect=10.0),
             )
@@ -893,7 +907,7 @@ def _apply_fixed_phrases(segments: list[dict]) -> int:
     return changed
 
 
-def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[list[dict], dict]:
+def proofread_segments(segments: list[dict], title: str, api_key: str, punctuate: bool = True) -> tuple[list[dict], dict]:
     """Fix Whisper homophone errors with an LLM, keeping timestamps.
 
     Whisper hears sounds and guesses characters, so fast game slang comes out
@@ -901,6 +915,12 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
     A language model reading the whole passage can fix these from context.
     Never raises: on any failure the original segments come back untouched.
     Returns (segments, stats) where stats counts changed lines and batches.
+
+    `punctuate` (default True, from the page's 自动加标点 switch): also add
+    punctuation, since Whisper's Chinese output has almost none. Adding
+    punctuation makes nearly every line "changed", so the batch gets a bigger
+    output-token cap and a bigger length allowance (the runaway guard would
+    otherwise reject long punctuated lines).
     """
     if not segments:
         return segments, {"changed": 0, "batches": 0, "failed": 0}
@@ -908,6 +928,9 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
     changed = 0
     batches = 0
     failed = 0  # batches where the model call itself failed (429, timeout, bad reply)
+    system = PROOFREAD_SYSTEM + (PROOFREAD_PUNCT_RULE,) if punctuate else PROOFREAD_SYSTEM
+    extra_chars = 60 if punctuate else 20
+    max_tokens = 8192 if punctuate else 4096
     # Anchor terms are computed once over the whole transcript and given to
     # every batch, so a one-off mishearing (CP5) can be caught against the
     # form that recurs (CT5) even when the two never share a batch.
@@ -916,7 +939,10 @@ def proofread_segments(segments: list[dict], title: str, api_key: str) -> tuple[
         batch = segments[base:base + PROOFREAD_BATCH]
         batches += 1
         try:
-            parsed = _proofread_batch(batch, title, api_key, anchors)
+            parsed = _proofread_batch(
+                batch, title, api_key, anchors,
+                system=system, extra_chars=extra_chars, max_tokens=max_tokens,
+            )
         except Exception:
             parsed = None
         if parsed is None:
@@ -1093,7 +1119,7 @@ def merge_segments(segments: list[dict], max_chars: int = 220, max_gap: float = 
 
 
 def do_transcribe(
-    url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False
+    url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False, punctuate: bool = True
 ) -> dict:
     """Run the whole pipeline in a worker thread. Returns the response dict.
 
@@ -1181,7 +1207,7 @@ def do_transcribe(
         proofread_stats = {"changed": 0, "batches": 0, "failed": 0}
         if is_chinese:
             try:
-                segments, proofread_stats = proofread_segments(segments, title, api_key)
+                segments, proofread_stats = proofread_segments(segments, title, api_key, punctuate)
             except Exception:
                 pass
             # Optional: put （中文意思） after English words. Runs after proofreading
@@ -1231,7 +1257,7 @@ jobs_lock = threading.Lock()
 JOB_TTL_SECONDS = 3600
 
 
-def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = False) -> None:
+def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = False, punctuate: bool = True) -> None:
     """Background worker: run the pipeline and store the outcome."""
     def on_stage(name: str):
         with jobs_lock:
@@ -1240,7 +1266,7 @@ def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = Fa
                 job["stage"] = name
 
     try:
-        result = do_transcribe(url, mode, api_key, on_stage=on_stage, annotate=annotate)
+        result = do_transcribe(url, mode, api_key, on_stage=on_stage, annotate=annotate, punctuate=punctuate)
         with jobs_lock:
             jobs[job_id] = {"status": "done", "stage": "done", **result}
     except PipelineError as exc:
@@ -1301,6 +1327,10 @@ async def transcribe(request: Request):
     # Optional switch from the page: add （中文意思） after English words.
     # Absent or anything else means off, so older pages behave as before.
     annotate = body.get("annotate") in (True, 1, "1", "true", "True")
+    # Punctuation switch from the page (自动加标点). Absent means ON: the
+    # switch defaults on in the page, and older pages never sent the field.
+    punct_raw = body.get("punctuate", True)
+    punctuate = punct_raw in (True, 1, "1", "true", "True")
 
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -1321,7 +1351,7 @@ async def transcribe(request: Request):
             "created_at": time.time(),
         }
     thread = threading.Thread(
-        target=_run_job, args=(job_id, url, mode, api_key, annotate), daemon=True
+        target=_run_job, args=(job_id, url, mode, api_key, annotate, punctuate), daemon=True
     )
     thread.start()
     return JSONResponse(
