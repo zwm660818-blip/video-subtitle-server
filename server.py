@@ -934,6 +934,43 @@ FIXED_PHRASES = {
     # on purpose: bare "Zoom" is a real app name (video conferencing) and
     # must not be rewritten elsewhere.
     "轻量版Zoom": "轻量版Sol",
+    # Reported 2026-11-20 on the Anthropic IPO video (transcribed with this
+    # tool). Whisper mishears the company/product names and several set
+    # phrases. Only the clear, unambiguous ones are listed; the garbled
+    # fragments that can't be pinned down ("老黄俗世缠身灯", "钱包馆",
+    # "你玄智的心意", "EFOIT", "垄断器人", "真正的猫") are left alone.
+    # Company / product names Whisper gets wrong:
+    "Astrobic": "Anthropic",
+    "Acerobic": "Anthropic",
+    "Cloud Code": "Claude Code",
+    "Chad GPT": "ChatGPT",
+    "CHPT": "ChatGPT",
+    "月支暗面": "月之暗面",
+    # "语述人行机器人" must come before "人行机器人" (it contains it).
+    "语述人行机器人": "宇树人形机器人",
+    "语书": "宇树",
+    "人行机器人": "人形机器人",
+    # Set phrases Whisper mangles (the wrong form is not a real phrase):
+    "试梦旅": "市梦率",
+    "试梦率": "市梦率",
+    "大步行": "大模型",
+    "库城河": "护城河",
+    "多头压柱": "多头押注",
+    "总规会": "总归会",
+    "尽亏损": "净亏损",
+    "一年十月": "一年十倍",
+    "那他们怎么付的": "那他们怎么富的",
+    "东戈一刀西凯一块": "东割一刀西砍一块",
+    "给老爷打公案": "给老A打工",
+    "压住了B端市场": "押注了B端市场",
+    "区别波动": "剧烈波动",
+    "一把就掳到了": "一把就撸到了",
+    # "Cloud" on its own = Claude (see FIXED_PATTERNS for the scoped cases);
+    # this one exact phrase is the Uber usage-rate line.
+    "Cloud的使用率": "Claude的使用率",
+    # "AI" heard as "AMI" ("担心 AMI一哪天"). Real "AMI" (Amazon Machine
+    # Image) is rare in these videos; a stray "AMI" token is Whisper.
+    "AMI": "AI",
 }
 # Regex rules for the same kind of trap, where the wrong form varies.
 # Reported 2026-11-19 on a "advice for young people" video, all three missed
@@ -950,6 +987,10 @@ FIXED_PATTERNS = [
     (re.compile(r"(?:失落|失错|实错|是错|使错)成本"), "试错成本"),
     (re.compile(r"陪(他们|她们|你们|大家|我们|你|他|她)(分享|交流|聊聊|聊一聊)"), r"跟\1\2"),
     (re.compile(r"(如果|要是|假如|假设)你将(给|跟)"), r"\1你想\2"),
+    # Reported 2026-11-20 on the Anthropic IPO video: standalone "Cloud"
+    # means Claude ("这个Cloud", "这Cloud", "老A的Cloud"). Bare "Cloud" is
+    # NOT rewritten: Google Cloud / iCloud are real names.
+    (re.compile(r"(这个|这|老A的)Cloud"), r"\1Claude"),
 ]
 
 
