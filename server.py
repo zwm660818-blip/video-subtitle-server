@@ -929,6 +929,11 @@ def _proofread_batch(
 FIXED_PHRASES = {
     "找脑子": "长脑子",
     "长脑子最贵的方式": "长脑子最累的方式",
+    # Reported 2026-11-20 on the GPT-6.2 video: the lightweight model is
+    # "Sol", but the tool wrote "Zoom" ("轻量版Zoom"). Scoped to "轻量版Zoom"
+    # on purpose: bare "Zoom" is a real app name (video conferencing) and
+    # must not be rewritten elsewhere.
+    "轻量版Zoom": "轻量版Sol",
 }
 # Regex rules for the same kind of trap, where the wrong form varies.
 # Reported 2026-11-19 on a "advice for young people" video, all three missed
