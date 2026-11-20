@@ -32,6 +32,10 @@
   .a-thumb{ width:54px;height:40px;border-radius:8px; background:#111827; color:#fff; display:grid; place-items:center; font-size:16px; flex-shrink:0; }
   .a-video b{ font-size:13px; display:block; line-height:1.4; }
   .a-video span{ font-size:12px; color:#6b7280; }
+  .a-upload{ width:100%; margin-top:12px; border:1.5px dashed #c3cad4; background:#f9fafb; color:#374151; border-radius:10px; padding:10px 12px; font-size:13.5px; font-weight:600; cursor:pointer; }
+  .a-upload:active{ background:#eef0f3; }
+  .a-upload:disabled{ opacity:.6; cursor:default; }
+  .a-upload-hint{ font-size:12px; color:#9ca3af; line-height:1.6; margin-top:8px; }
 
   .seg{ display:flex; background:#eef0f3; border-radius:10px; padding:3px; gap:3px; }
   .seg button{ flex:1; border:0; background:transparent; border-radius:8px; font-size:13px; font-weight:600; color:#6b7280; cursor:pointer; padding:7px 4px; }
@@ -115,6 +119,9 @@
       <button class="a-clear" id="clear-btn" onclick="clearLink()" aria-label="清空输入框">×</button>
       <button class="a-paste" onclick="pasteLink()">粘贴</button>
     </div>
+    <input type="file" id="file-input" accept="video/*,audio/*" style="display:none">
+    <button class="a-upload" id="upload-btn" type="button" onclick="pickLocalFile()">上传本地视频 / 音频</button>
+    <div class="a-upload-hint">链接解析不了时，把视频存到手机相册再传进来也行（最大 500MB）。</div>
     <div class="a-video" id="video-card">
       <div class="a-thumb">▶</div>
       <div><b id="video-title"></b><span id="video-meta"></span></div>
@@ -708,8 +715,8 @@ function openHistory(idx){
   renderResult(rec, rec.url || '', { restored: true });
   document.getElementById('result').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
-function savePendingJob(jobId, url){
-  try { storeSet(LS_JOB, JSON.stringify({ jobId: jobId, url: url, mode: currentMode, startedAt: Date.now() })); } catch(e) {}
+function savePendingJob(jobId, url, title){
+  try { storeSet(LS_JOB, JSON.stringify({ jobId: jobId, url: url, title: title || '', mode: currentMode, startedAt: Date.now() })); } catch(e) {}
 }
 function clearPendingJob(){ storeRemove(LS_JOB); }
 function setMode(mode){
@@ -1106,6 +1113,103 @@ async function runTranscribe(){
   }
 }
 
+/* ---------- 本地上传音视频：链接解析不了时的兜底入口 ----------
+   选完文件立刻上传，不用再点开始。先在前端查大小（超过 500MB 不发请求），
+   FormData POST 到 /transcribe-file 拿 job_id（超时放宽到 5 分钟），
+   之后和链接转写共用同一套：确认服务器醒着 → 每 2 秒轮询 → 渲染/存历史。
+   没有解析和下载两步，进度直接从第 3 步开始；标题用文件名。 */
+var UPLOAD_MAX_BYTES = 500 * 1024 * 1024;
+var UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+function pickLocalFile(){
+  if(running){ toast('正在转写中，等这一条转完再传'); return; }
+  document.getElementById('file-input').click();
+}
+document.getElementById('file-input').addEventListener('change', function(){
+  var file = this.files && this.files[0];
+  this.value = '';   /* 清掉，同一个文件下次还能再选 */
+  if(file) runUploadFile(file);
+});
+function postFileJob(file){
+  var fd = new FormData();
+  fd.append('file', file);
+  fd.append('mode', currentMode);
+  fd.append('annotate', String(isAnnotateOn()));
+  fd.append('punctuate', String(punctuateOn));
+  return fetchT(API_BASE + '/transcribe-file', { method: 'POST', body: fd }, UPLOAD_TIMEOUT_MS).then(function(res){
+    return res.text().then(function(text){
+      var data = null;
+      try { data = JSON.parse(text); } catch(e) {}
+      return { res: res, data: data, text: text };
+    });
+  });
+}
+async function runUploadFile(file){
+  if(running) return;
+  if(!file.size){
+    showError('这个文件是空的，换一个再传。', '');
+    return;
+  }
+  if(file.size > UPLOAD_MAX_BYTES){
+    showError('文件超过 500MB，传不上去，剪短一点或者压小一点再传。', '');
+    return;
+  }
+  running = true;
+  hideError();
+  document.getElementById('result').classList.remove('show');
+  document.getElementById('video-card').classList.remove('show');
+  var cta = document.getElementById('cta');
+  var upBtn = document.getElementById('upload-btn');
+  var stepsBox = document.getElementById('steps');
+  stepsBox.classList.add('show');
+  cta.disabled = true; cta.textContent = '转写中，别关页面…';
+  upBtn.disabled = true; upBtn.textContent = '正在上传：' + file.name;
+  resetSteps();
+  applyStage('transcribe');   /* 跳过唤醒/解析下载，进度直接从第 3 步开始 */
+  startElapsed();
+  var deadline = Date.now() + TIMEOUT_MS;
+  try {
+    var out = null;
+    try { out = await postFileJob(file); } catch(e) { out = null; }
+    if(!out || !out.data){
+      throw { plain: '文件没传上去，可能是网络太慢，或者服务器还没醒。等一会儿再传一次。', raw: '上传请求 5 分钟内没拿到服务器的回应' };
+    }
+    var jobId = jobIdFrom(out);
+    /* 拿到任务号后先确认服务器醒着：没醒走现有的唤醒过程，最多等 3 分钟 */
+    if(!(Date.now() - serverAwakeAt < AWAKE_FRESH_MS || await checkHealth())){
+      var awake = await wakeAndWait(deadline);
+      if(!awake){
+        throw { plain: '服务器一直没醒过来，等一两分钟再传一次。', raw: '已调唤醒接口并等了 3 分钟，服务器都没正常回应' };
+      }
+    }
+    document.getElementById('wake-note').classList.remove('show');
+    storeRemove(LS_RESULT);
+    savePendingJob(jobId, '', file.name);
+    applyStage('transcribe');
+    var data = await pollJob(jobId, deadline);
+    clearPendingJob();
+    data.title = file.name;   /* 结果标题用文件名 */
+    var rec = saveResult(data, '');
+    pushHistory(rec);
+    finishProgress();
+    renderResult(rec, '');
+    cta.disabled = false; cta.textContent = '再转一遍';
+    upBtn.disabled = false; upBtn.textContent = '上传本地视频 / 音频';
+    running = false;
+  } catch(err) {
+    clearPendingJob();
+    stopProgress();
+    stepsBox.classList.remove('show');
+    cta.disabled = false; cta.textContent = '开始转字幕';
+    upBtn.disabled = false; upBtn.textContent = '上传本地视频 / 音频';
+    running = false;
+    if(err && err.plain){
+      showError(err.plain, err.raw || '');
+    } else {
+      showError('文件没传上去。可能是服务器还在睡觉，或者网络断了一下。等半分钟再试一次。', err && err.message ? String(err.message) : '');
+    }
+  }
+}
+
 /* ---------- 渲染真实结果 ---------- */
 /* 只画字幕列表：时间点开关切换时也走这里重画 */
 function renderLines(data){
@@ -1289,6 +1393,7 @@ async function resumeJob(job){
   try {
     var data = await pollJob(job.jobId, deadline);
     clearPendingJob();
+    if(job.title) data.title = job.title;   /* 本地上传的任务：标题用文件名 */
     var rec = saveResult(data, job.url || '');
     pushHistory(rec);
     finishProgress();

@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -40,6 +40,10 @@ CHROME_UA = (
 # downloader gives up on that address at once and moves to the next one.
 _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
 ZACAO_URL = "https://video.zacao.top/api/parse/v2"
+# zacao /api/detail returns a post's metadata: title, desc (正文/描述),
+# type (video/image/note), author, stats. Used by POST /article to
+# extract a Douyin article/note's text without downloading any media.
+ZACAO_DETAIL_URL = "https://video.zacao.top/api/detail"
 HK0_BASE = "https://api.hk0.cc/api"
 # hk0.cc fallback parser (no key needed). zacao's WeChat parser broke on
 # 2026-11-18 (HTTP 401 for every WeChat link; Douyin/Kuaishou still fine),
@@ -917,8 +921,14 @@ def _proofread_batch(
 #   ("长脑子最累的方式就是多看辩论赛"), proofreader changed 6 other lines
 #   in that job but left this one. "长脑子" is the idiom for growing one's
 #   brain; "找脑子" (searching for a brain) makes no sense in context.
+# - "长脑子最贵的方式" -> "长脑子最累的方式": same debate video, first
+#   sentence. Whisper hears 累 (lei) as 贵 (gui); verified live 2026-11-19
+#   the line still came out "最贵" after the 找脑子 fix. Scoped to the full
+#   phrase on purpose: bare "最贵" is often correct elsewhere ("最贵的手机"),
+#   so only this exact opening line is rewritten.
 FIXED_PHRASES = {
     "找脑子": "长脑子",
+    "长脑子最贵的方式": "长脑子最累的方式",
 }
 # Regex rules for the same kind of trap, where the wrong form varies.
 # Reported 2026-11-19 on a "advice for young people" video, all three missed
@@ -1166,13 +1176,18 @@ def merge_segments(segments: list[dict], max_chars: int = 220, max_gap: float = 
 
 
 def do_transcribe(
-    url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False, punctuate: bool = True
+    url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False, punctuate: bool = True,
+    local_file: str | None = None, local_title: str | None = None,
 ) -> dict:
     """Run the whole pipeline in a worker thread. Returns the response dict.
 
     on_stage, when given, is called with the current stage name so a caller
     running this in the background can report real progress: parse, download,
     audio, transcribe, proofread.
+
+    local_file: when set, the video/audio is already on disk (user upload),
+    so parse/download are skipped and the job starts at the audio stage.
+    local_title is the display title for an upload (its filename).
     """
     # Stage marks -> per-stage seconds, returned as "timings" and printed to
     # the log, so "where did the time go" is a fact, not a guess.
@@ -1198,25 +1213,32 @@ def do_transcribe(
     model = MODELS.get(mode, MODELS["fast"])
     with tempfile.TemporaryDirectory(prefix="vts-") as tmp:
         tmpdir = Path(tmp)
-        stage("parse")
-        title_box = {"title": "未命名视频"}
+        if local_file is not None:
+            # Local upload: the file is already on disk, so there is no
+            # parse/download step. The job goes straight to the audio stage.
+            title = local_title or "本地上传"
+            video_path = Path(local_file)
+            stage("audio")
+        else:
+            stage("parse")
+            title_box = {"title": "未命名视频"}
 
-        def candidate_urls():
-            # Lazy: the first address from either parser starts the download
-            # at once; the slower parser is only waited for if needed.
-            for t, u in stream_candidates(url):
-                if not title_box.get("seen"):
-                    title_box["title"] = t
-                    title_box["seen"] = True
-                stage("download")
-                yield u
+            def candidate_urls():
+                # Lazy: the first address from either parser starts the download
+                # at once; the slower parser is only waited for if needed.
+                for t, u in stream_candidates(url):
+                    if not title_box.get("seen"):
+                        title_box["title"] = t
+                        title_box["seen"] = True
+                    stage("download")
+                    yield u
 
-        video_path = tmpdir / "video.mp4"
-        # Tries every candidate address; if all fail, re-parses the link for
-        # fresh addresses and tries those too.
-        download_with_reparse(url, candidate_urls(), video_path)
-        title = title_box["title"]
-        stage("audio")
+            video_path = tmpdir / "video.mp4"
+            # Tries every candidate address; if all fail, re-parses the link for
+            # fresh addresses and tries those too.
+            download_with_reparse(url, candidate_urls(), video_path)
+            title = title_box["title"]
+            stage("audio")
         duration = probe_duration(video_path)
         audio_path = extract_audio(video_path, tmpdir)
         chunks = split_audio(audio_path, duration, tmpdir)
@@ -1333,6 +1355,47 @@ def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = Fa
             }
 
 
+def _run_file_job(job_id: str, file_path: str, filename: str, mode: str, api_key: str,
+                  annotate: bool = False, punctuate: bool = True) -> None:
+    """Background worker for an uploaded file. Same pipeline as a link,
+    minus parse/download. Deletes the uploaded file when the job ends,
+    success or failure, so uploads don't fill the container disk."""
+    def on_stage(name: str):
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is not None:
+                job["stage"] = name
+
+    try:
+        title = Path(filename).stem or "本地上传"
+        result = do_transcribe(
+            "", mode, api_key, on_stage=on_stage,
+            annotate=annotate, punctuate=punctuate,
+            local_file=file_path, local_title=title,
+        )
+        with jobs_lock:
+            jobs[job_id] = {"status": "done", "stage": "done", **result}
+    except PipelineError as exc:
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": "error", "stage": "error",
+                "error": exc.message, "step": exc.step,
+            }
+    except Exception as exc:  # pragma: no cover - safety net
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": "error", "stage": "error",
+                "error": f"服务器内部出错: {exc}", "step": "server",
+            }
+    finally:
+        try:
+            parent = Path(file_path).parent
+            Path(file_path).unlink(missing_ok=True)
+            parent.rmdir()
+        except Exception:
+            pass
+
+
 def _cleanup_jobs() -> None:
     now = time.time()
     with jobs_lock:
@@ -1402,6 +1465,116 @@ async def transcribe(request: Request):
         }
     thread = threading.Thread(
         target=_run_job, args=(job_id, url, mode, api_key, annotate, punctuate), daemon=True
+    )
+    thread.start()
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "status": "processing"},
+    )
+
+
+# Uploads: a phone video can be big, but the container disk is not.
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500MB
+
+
+@app.post("/transcribe-file")
+async def transcribe_file_upload(
+    file: UploadFile = File(...),
+    mode: str = Form("fast"),
+    annotate: str = Form("false"),
+    punctuate: str = Form("true"),
+):
+    """Transcribe a file the user uploaded from their device.
+
+    Same pipeline as /transcribe, minus link parsing and downloading: the
+    file is already here. This is the fallback for when a platform's link
+    parser breaks -- save the video locally and upload it instead.
+    """
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": "服务器没有设置 GROQ_API_KEY，请在部署平台的环境变量里添加后再试",
+                "step": "config",
+            },
+        )
+    if file is None or not file.filename:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "没有收到文件，请重新选择", "step": "input"},
+        )
+    mode = (mode or "fast").strip().lower()
+    if mode not in MODELS:
+        mode = "fast"
+    annotate_flag = str(annotate).strip().lower() in ("1", "true", "on")
+    punctuate_flag = str(punctuate).strip().lower() not in ("0", "false", "off", "")
+
+    # Save the upload to a per-job temp dir, streaming in 1MB chunks so a
+    # big phone video doesn't sit whole in memory. Enforce the size cap
+    # while writing so an oversized upload fails fast.
+    job_dir = Path(tempfile.mkdtemp(prefix="vts-upload-"))
+    safe_name = Path(file.filename).name or "upload.bin"
+    dest = job_dir / safe_name
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise ValueError("文件超过 500MB 上限")
+                out.write(chunk)
+    except ValueError as exc:
+        try:
+            dest.unlink(missing_ok=True)
+            job_dir.rmdir()
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=413,
+            content={"ok": False, "error": f"{exc}，请传小一点的文件或剪短再传", "step": "input"},
+        )
+    except Exception as exc:
+        try:
+            dest.unlink(missing_ok=True)
+            job_dir.rmdir()
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": f"文件保存失败: {exc}", "step": "upload"},
+        )
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+    if size == 0:
+        try:
+            dest.unlink(missing_ok=True)
+            job_dir.rmdir()
+        except Exception:
+            pass
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "文件是空的，请重新选择", "step": "input"},
+        )
+
+    _cleanup_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "processing", "stage": "audio",
+            "created_at": time.time(),
+        }
+    thread = threading.Thread(
+        target=_run_file_job,
+        args=(job_id, str(dest), safe_name, mode, api_key, annotate_flag, punctuate_flag),
+        daemon=True,
     )
     thread.start()
     return JSONResponse(
@@ -1541,3 +1714,116 @@ def translate(body: dict):
         if base + TRANSLATE_BATCH < len(segments):
             time.sleep(2)
     return JSONResponse(status_code=200, content={"segments": out})
+
+
+# ---------------------------------------------------------------- article
+# Douyin article / note text extraction (goal: Douyin article extractor).
+# A Douyin article is NOT a video, so /transcribe can't handle it (no
+# audio). This endpoint takes a share text or link, pulls the post's
+# metadata from zacao /api/detail, and returns its text (desc).
+#
+# Hard limit, verified 2026-11-19: a bare Douyin share code (口令, e.g.
+# "La8W6zvXwb9") with NO link in the text cannot be resolved by any tool
+# -- zacao, hk0, and every GitHub Douyin parser all work by extracting a
+# URL from the share text, and a commercial extractor (LinkDigest) states
+# outright "只有口令、没有链接的那种读不了". The code is an opaque
+# server-side lookup only the Douyin app can open (it is NOT a
+# v.douyin.com short code either -- that redirects to the homepage).
+# So when the text has no URL we return a clear 400 telling the user to
+# open the article in the Douyin app -> 分享 -> 复制链接 and paste the
+# text that contains the link.
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _extract_url_from_text(text: str) -> str | None:
+    """First http(s) URL in a share text, or None (bare share code)."""
+    m = _URL_RE.search(text or "")
+    return m.group(0).rstrip(".,)]}") if m else None
+
+
+def _fetch_article_detail(url: str) -> tuple[dict | None, str]:
+    """Call zacao /api/detail. Returns (data, '') or (None, error)."""
+    try:
+        resp = httpx.post(
+            ZACAO_DETAIL_URL,
+            json={"text": url},
+            headers={"User-Agent": CHROME_UA, "Content-Type": "application/json"},
+            timeout=httpx.Timeout(60.0, connect=10.0),
+        )
+    except httpx.RequestError as exc:
+        return None, f"解析服务连不上：{exc}"
+    if resp.status_code != 200:
+        return None, f"解析服务返回 {resp.status_code}"
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        return None, "解析服务返回的不是 JSON"
+    if payload.get("code") != 200 or not payload.get("succ", True):
+        return None, str(payload.get("message") or payload.get("msg") or "链接不可识别")
+    data = payload.get("data") or {}
+    if not data:
+        return None, "解析服务没有返回内容"
+    return data, ""
+
+
+@app.post("/article")
+def article(body: dict):
+    """Extract a Douyin article/note's text.
+
+    Body: {"text": "<share text or link>"}.
+    Returns {"ok": true, "title", "desc", "type", "author", "work_id",
+    "publish_time_str", "stats", "url"}. For image-carousel notes
+    (type "image") desc is only the caption -- the body text is baked
+    into the images, so the response flags that.
+    """
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "请先粘贴文章的分享文字或链接"},
+        )
+    url = _extract_url_from_text(text)
+    if not url:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": (
+                    "这段文字里没有链接，只有一串口令码，解析工具解不出来。"
+                    "口令码只有抖音 App 自己能打开：请在抖音里打开这篇文章，"
+                    "点分享 → 复制链接，把带链接的那段文字发过来再提。"
+                ),
+                "step": "share_code_only",
+            },
+        )
+    data, err = _fetch_article_detail(url)
+    if data is None:
+        return JSONResponse(
+            status_code=502,
+            content={"ok": False, "error": err, "step": "parse"},
+        )
+    author = data.get("author") or {}
+    content_type = str(data.get("type") or "")
+    desc = str(data.get("desc") or "")
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "title": str(data.get("title") or ""),
+            "desc": desc,
+            "type": content_type,
+            "author": str(author.get("nickname") or ""),
+            "work_id": str(data.get("work_id") or ""),
+            "publish_time_str": str(data.get("publish_time_str") or ""),
+            "stats": data.get("stats") or {},
+            "url": url,
+            # Image-carousel notes keep their body text in the pictures,
+            # not in desc -- say so instead of pretending desc is the
+            # whole article.
+            "note": (
+                "这条是图文，配文只有上面这段，正文在图片里，暂不支持图片识字。"
+                if content_type == "image"
+                else ""
+            ),
+        },
+    )
