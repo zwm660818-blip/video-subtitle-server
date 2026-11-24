@@ -44,6 +44,18 @@ ZACAO_URL = "https://video.zacao.top/api/parse/v2"
 # type (video/image/note), author, stats. Used by POST /article to
 # extract a Douyin article/note's text without downloading any media.
 ZACAO_DETAIL_URL = "https://video.zacao.top/api/detail"
+# digitaldialogue.com.au /api/info: free public parse API, no key, no
+# login. Douyin / TikTok / X / Instagram only (Bilibili and WeChat return
+# "不支持的链接"). Added 2026-11-24 after zacao started requiring an API
+# key (401) -- Douyin parsing was down to hk0 alone. It calls Douyin's
+# own web API through the embed-player lane (Origin open.douyin.com, no
+# cookies, no signature) and returns a direct CDN URL + title.
+# The direct URL is short-lived (~5 min signed), so it must be downloaded
+# immediately -- which the pipeline does (parse then download right away).
+# Fetch it WITHOUT Referer and WITHOUT cookies; the download step sends no
+# Referer for zjcdn.com URLs, which matches.
+DD_INFO_URL = "https://digitaldialogue.com.au/api/info"
+DD_HOSTS = ("douyin.com", "tiktok.com", "twitter.com", "x.com", "instagram.com")
 HK0_BASE = "https://api.hk0.cc/api"
 # hk0.cc fallback parser (no key needed). zacao's WeChat parser broke on
 # 2026-11-18 (HTTP 401 for every WeChat link; Douyin/Kuaishou still fine),
@@ -379,21 +391,57 @@ def _parse_via_hk0(url: str) -> tuple[str, str, list[str], bool] | None:
     return video_url, str(title), backups, is_huge
 
 
-PARSERS = [("zacao", _parse_via_zacao), ("hk0", _parse_via_hk0)]
+def _parse_via_digitaldialogue(url: str) -> tuple[str, str, list[str], bool] | None:
+    """Try digitaldialogue.com.au /api/info (free, no key). Douyin /
+    TikTok / X / Instagram only. Returns (video_url, title, backups,
+    is_huge) or None. The direct URL is short-lived (~5 min), so the
+    pipeline must download it at once -- it does."""
+    if not any(host in url for host in DD_HOSTS):
+        return None
+    try:
+        resp = httpx.get(
+            DD_INFO_URL,
+            params={"url": url},
+            headers={"User-Agent": CHROME_UA},
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            follow_redirects=True,
+        )
+    except httpx.RequestError:
+        return None
+    if resp.status_code != 200:
+        return None
+    payload = _json_loose(resp.text)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("error"):
+        return None
+    direct = payload.get("direct") or {}
+    video_url = direct.get("url")
+    if not video_url:
+        return None
+    title = payload.get("title") or "未命名视频"
+    return video_url, str(title), [], False
+
+
+PARSERS = [
+    ("zacao", _parse_via_zacao),
+    ("hk0", _parse_via_hk0),
+    ("digitaldialogue", _parse_via_digitaldialogue),
+]
 
 
 def stream_candidates(url: str):
     """Step 1: resolve the link, yielding (title, video_url) AS EACH PARSER
     FINISHES instead of waiting for all of them.
 
-    Both parsers (zacao and hk0.cc) are started at the same time in
-    background threads. Before, they ran one after the other, each allowed
-    up to 60 s, so one slow or hanging parser cost a full minute before the
-    other was even asked (a 3-minute video spent ~60 s in "parse"). Now the
-    download starts on the first address that arrives; the slower parser's
-    addresses are only waited for if the first ones fail to download (e.g.
-    Errno 101 on an unreachable CDN host), so no time is lost and no
-    fallback is lost either.
+    All three parsers (zacao, hk0.cc, digitaldialogue) are started at the
+    same time in background threads. Before, they ran one after the other,
+    each allowed up to 60 s, so one slow or hanging parser cost a full
+    minute before the other was even asked (a 3-minute video spent ~60 s
+    in "parse"). Now the download starts on the first address that
+    arrives; the slower parser's addresses are only waited for if the
+    first ones fail to download (e.g. Errno 101 on an unreachable CDN
+    host), so no time is lost and no fallback is lost either.
 
     Within one parser's answer the order is: normal address, its backups,
     and a huge original file (hk0 sometimes returns 751 MB for a 7-minute
