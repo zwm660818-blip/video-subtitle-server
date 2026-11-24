@@ -709,13 +709,18 @@ def split_audio(mp3_path: Path, duration: float, tmpdir: Path) -> list[tuple[Pat
     Returns a list of (chunk_path, time_offset_seconds). Each chunk is cut
     with a stream copy (no re-encode, nearly instant) when the source
     allows it; falls back to re-encoding to 128k MP3. Chunk length is
-    sized by the MP3 output bitrate (23 MB / 16 KB/s = 1507s), which is
-    safe for both AAC and MP3 sources.
+    sized from the source's actual bitrate (23 MB target), so a
+    high-bitrate AAC source gets shorter chunks than a 128k MP3.
     """
     size = mp3_path.stat().st_size
     if size <= MAX_GROQ_BYTES:
         return [(mp3_path, 0.0)]
-    chunk_seconds = max(60, (23 * 1024 * 1024) // 16000)
+    # Size chunks by the ACTUAL bitrate, not an assumed 128k: a 1507s chunk
+    # of 166k AAC is ~31 MB and Groq rejects it with 413 (seen 2026-11-24
+    # on a 27-min Bilibili video). 23 MB target leaves headroom under the
+    # 25 MB limit; floor at 60s so a very high-bitrate source still moves.
+    bytes_per_sec = size / duration if duration > 0 else 16000
+    chunk_seconds = max(60, int((23 * 1024 * 1024) / bytes_per_sec))
     chunks: list[tuple[Path, float]] = []
     start = 0.0
     index = 0
