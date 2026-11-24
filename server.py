@@ -232,6 +232,58 @@ def _run(cmd: list[str], step: str, what: str) -> str:
 
 # ---------------------------------------------------------------- pipeline
 
+def _resolve_url(url: str) -> str:
+    """Follow redirects to the final URL. Short links (b23.tv, v.douyin.com
+    without a host entry, etc.) redirect to the real platform page; the
+    parsers match on the host name, so an unresolved short link matches
+    nothing and parse fails. Returns the original URL on any failure."""
+    try:
+        resp = httpx.head(
+            url,
+            headers={"User-Agent": CHROME_UA},
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=True,
+        )
+        final = str(resp.url)
+        if final and final != url:
+            print(f"[resolve] {url} -> {final}", flush=True)
+            return final
+    except httpx.RequestError:
+        pass
+    # HEAD is sometimes rejected (405/403); try a tiny GET with Range.
+    try:
+        with httpx.stream(
+            "GET", url,
+            headers={"User-Agent": CHROME_UA, "Range": "bytes=0-0"},
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=True,
+        ) as resp:
+            final = str(resp.url)
+            if final and final != url:
+                print(f"[resolve] {url} -> {final}", flush=True)
+                return final
+    except httpx.RequestError:
+        pass
+    return url
+
+
+def _json_loose(text: str):
+    """Parse JSON from a response body that may have non-JSON junk prepended
+    (hk0's Bilibili endpoint prints PHP Deprecated warnings before the JSON,
+    which makes resp.json() raise). Returns the parsed object or None."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    i = text.find("{")
+    if i < 0:
+        return None
+    try:
+        return json.loads(text[i:])
+    except json.JSONDecodeError:
+        return None
+
+
 def _parse_via_zacao(url: str) -> tuple[str, str, list[str], bool] | None:
     """Try zacao. Returns (video_url, title, backup_urls, is_huge) or None."""
     try:
@@ -246,9 +298,8 @@ def _parse_via_zacao(url: str) -> tuple[str, str, list[str], bool] | None:
         return None
     if resp.status_code != 200:
         return None
-    try:
-        payload = resp.json()
-    except json.JSONDecodeError:
+    payload = _json_loose(resp.text)
+    if not isinstance(payload, dict):
         return None
     if payload.get("code") != 200:
         return None
@@ -298,9 +349,8 @@ def _parse_via_hk0(url: str) -> tuple[str, str, list[str], bool] | None:
         return None
     if resp.status_code != 200:
         return None
-    try:
-        payload = resp.json()
-    except json.JSONDecodeError:
+    payload = _json_loose(resp.text)
+    if not isinstance(payload, dict):
         return None
     if payload.get("code") != 200:
         return None
@@ -350,6 +400,9 @@ def stream_candidates(url: str):
     video) is held back until every parser has reported, so a compressed
     version from the other parser is preferred.
     Raises PipelineError("parse") only if NO address came out at all."""
+    # Resolve short links first (b23.tv -> bilibili.com, etc.): the parsers
+    # match on the host name, and an unresolved short link matches nothing.
+    url = _resolve_url(url)
     results: "queue.Queue[tuple[str, float, tuple | None]]" = queue.Queue()
 
     def work(name, fn):
