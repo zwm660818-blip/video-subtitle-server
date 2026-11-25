@@ -1087,6 +1087,11 @@ FIXED_PHRASES = {
     # Same video: the famous quote 王侯将相宁有种乎 came out as
     # "王洪江、向宁永走". The wrong form is not a real phrase.
     "王洪江、向宁永走": "王侯将相宁有种乎",
+    # Reported 2026-11-25 on the Douyin video "挣钱的底层逻辑": the
+    # gap-filled turbo segment heard 大号 (big account, da hao) as 大傲
+    # (da ao). "这个大傲" is not a real phrase; in context it is always
+    # "这个大号" (my big account, e.g. one with 90万 followers).
+    "这个大傲": "这个大号",
 }
 # Regex rules for the same kind of trap, where the wrong form varies.
 # Reported 2026-11-19 on a "advice for young people" video, all three missed
