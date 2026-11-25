@@ -1131,6 +1131,13 @@ FIXED_PATTERNS = [
     # 会/变成/变/是 + 复战, or 复战 + 累累 (负债累累 is the set phrase).
     (re.compile(r"(会|变成|变|是)复战"), r"\1负债"),
     (re.compile(r"复战(累累)"), r"负债\1"),
+    # Reported 2026-11-25 by the user himself on the Douyin video
+    # "挣钱的底层逻辑": the speaker says 深耕 (shen geng, cultivate
+    # deeply in an industry), Whisper hears 生根 (sheng gen, take root).
+    # "生根" IS a real word (a plant taking root), so only rewrite it
+    # after the industry context words 那就是 / 一直不断的去 / 行业 /
+    # 说的 -- in a business video that is always 深耕, never 生根.
+    (re.compile(r"(那就是|一直不断的去|行业|说的)生根"), r"\1深耕"),
 ]
 
 
