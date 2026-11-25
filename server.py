@@ -1092,6 +1092,18 @@ FIXED_PHRASES = {
     # (da ao). "这个大傲" is not a real phrase; in context it is always
     # "这个大号" (my big account, e.g. one with 90万 followers).
     "这个大傲": "这个大号",
+    # Reported 2026-11-25 on the same video (verified by a second pass
+    # with local faster-whisper small+medium): three more mishearings.
+    # "一上来就说哈" is Whisper hearing 梭哈 (suo ha, go all-in, the
+    # gambling term) as 说哈. The full phrase is not a real expression.
+    "一上来就说哈": "一上来就梭哈",
+    # "他会反评" is Whisper hearing 返贫 (fan pin, become poor again) as
+    # 反评. "反评" is not a word; "挣到钱之后又返贫" is the only sense.
+    "会反评": "会返贫",
+    # "这个时候可听就会有同学问了" is Whisper hearing 肯定 (ken ding,
+    # definitely) as 可听. "可听" IS a real word (audible), so only the
+    # full phrase is rewritten, never bare "可听".
+    "这个时候可听就会有同学问了": "这个时候肯定就会有同学问了",
 }
 # Regex rules for the same kind of trap, where the wrong form varies.
 # Reported 2026-11-19 on a "advice for young people" video, all three missed
@@ -1349,7 +1361,7 @@ def merge_segments(segments: list[dict], max_chars: int = 220, max_gap: float = 
     return merged
 
 
-def _fill_transcript_gaps(primary: list[dict], secondary: list[dict], gap_threshold: float = 6.0, tol: float = 0.5) -> list[dict]:
+def _fill_transcript_gaps(primary: list[dict], secondary: list[dict], gap_threshold: float = 4.0, tol: float = 1.0) -> list[dict]:
     """Fill long silence gaps in the primary transcript with secondary-model segments.
 
     Whisper sometimes skips whole passages -- the model just doesn't emit
@@ -1358,14 +1370,16 @@ def _fill_transcript_gaps(primary: list[dict], secondary: list[dict], gap_thresh
     about the 90万-follower account that turbo caught, while turbo dropped
     the 放马后炮 and 运气占80% passages that large-v3 caught. So when the
     primary transcript has a long gap (> gap_threshold) between two segments,
-    fill it with secondary segments that fall inside the gap. Only segments
-    fully inside the gap are inserted (tol is small on purpose: the two
-    models split the same speech at slightly different times, so a generous
-    tolerance would re-insert the boundary segments as duplicates). A gap
-    is only filled when the secondary model actually heard speech there,
-    so a real silence stays empty. Returns a new time-sorted list. The
-    proofreader runs after this, so any mishearing in the inserted
-    segments gets the same correction pass.
+    fill it with secondary segments that fall inside the gap. A gap is only
+    filled when the secondary model actually heard speech there, so a real
+    silence stays empty. The tolerance is 1.0s on purpose: the two models
+    split the same speech at slightly different times, so a segment that
+    holds unique content can straddle the gap edge by a fraction of a
+    second. That also lets a boundary segment slip in twice, so after
+    merging, adjacent segments with identical text and overlapping times
+    are de-duplicated. Returns a new time-sorted list. The proofreader
+    runs after this, so any mishearing in the inserted segments gets the
+    same correction pass.
     """
     if not primary or not secondary:
         return primary
@@ -1390,7 +1404,20 @@ def _fill_transcript_gaps(primary: list[dict], secondary: list[dict], gap_thresh
             if gap_end - gap_start > gap_threshold:
                 merged.extend(inside(gap_start, gap_end))
     merged.sort(key=lambda s: float(s.get("start", 0)))
-    return merged
+    # De-duplicate: the 1.0s tolerance can re-insert a boundary segment
+    # the primary already has (same speech, split at a slightly different
+    # time). Drop a segment when its text matches the previous one and
+    # their times overlap or touch.
+    deduped: list[dict] = []
+    for seg in merged:
+        if deduped:
+            prev = deduped[-1]
+            same_text = (seg.get("text") or "").strip() == (prev.get("text") or "").strip()
+            overlap = float(seg.get("start", 0)) <= float(prev.get("end", 0)) + 1.0
+            if same_text and overlap and (seg.get("text") or "").strip():
+                continue
+        deduped.append(seg)
+    return deduped
 
 
 def do_transcribe(
