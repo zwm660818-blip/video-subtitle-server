@@ -1344,6 +1344,50 @@ def merge_segments(segments: list[dict], max_chars: int = 220, max_gap: float = 
     return merged
 
 
+def _fill_transcript_gaps(primary: list[dict], secondary: list[dict], gap_threshold: float = 6.0, tol: float = 0.5) -> list[dict]:
+    """Fill long silence gaps in the primary transcript with secondary-model segments.
+
+    Whisper sometimes skips whole passages -- the model just doesn't emit
+    them -- and the two models skip DIFFERENT passages. Verified 2026-11-25
+    on the Douyin video 挣钱的底层逻辑: large-v3 dropped the ~15s passage
+    about the 90万-follower account that turbo caught, while turbo dropped
+    the 放马后炮 and 运气占80% passages that large-v3 caught. So when the
+    primary transcript has a long gap (> gap_threshold) between two segments,
+    fill it with secondary segments that fall inside the gap. Only segments
+    fully inside the gap are inserted (tol is small on purpose: the two
+    models split the same speech at slightly different times, so a generous
+    tolerance would re-insert the boundary segments as duplicates). A gap
+    is only filled when the secondary model actually heard speech there,
+    so a real silence stays empty. Returns a new time-sorted list. The
+    proofreader runs after this, so any mishearing in the inserted
+    segments gets the same correction pass.
+    """
+    if not primary or not secondary:
+        return primary
+    primary = sorted(primary, key=lambda s: float(s.get("start", 0)))
+    secondary = sorted(secondary, key=lambda s: float(s.get("start", 0)))
+
+    def inside(lo: float, hi: float) -> list[dict]:
+        return [dict(s) for s in secondary
+                if float(s.get("start", 0)) >= lo - tol
+                and float(s.get("end", 0)) <= hi + tol
+                and (s.get("text") or "").strip()]
+
+    merged: list[dict] = []
+    first_start = float(primary[0].get("start", 0))
+    if first_start > gap_threshold:
+        merged.extend(inside(0.0, first_start))
+    for i, seg in enumerate(primary):
+        merged.append(dict(seg))
+        if i + 1 < len(primary):
+            gap_start = float(seg.get("end", 0))
+            gap_end = float(primary[i + 1].get("start", 0))
+            if gap_end - gap_start > gap_threshold:
+                merged.extend(inside(gap_start, gap_end))
+    merged.sort(key=lambda s: float(s.get("start", 0)))
+    return merged
+
+
 def do_transcribe(
     url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False, punctuate: bool = True,
     local_file: str | None = None, local_title: str | None = None,
@@ -1414,6 +1458,7 @@ def do_transcribe(
 
         stage("transcribe")
         segments: list[dict] = []
+        segments_fast: list[dict] = []
         detected_lang = ""
         for chunk_path, offset in chunks:
             # First chunk auto-detects the language; the rest reuse it so
@@ -1427,6 +1472,21 @@ def do_transcribe(
                     "end": round(float(seg.get("end", 0)) + offset, 2),
                     "text": seg.get("text", ""),
                 })
+            if mode == "accurate":
+                # Accurate mode also runs turbo and fills the gaps large-v3
+                # skipped (see _fill_transcript_gaps). Turbo is the
+                # secondary here: it catches passages large-v3 drops, and
+                # its own mishearings get fixed by the proofreader below.
+                # Fast mode stays single-model so it stays fast.
+                result_fast = transcribe_file(chunk_path, MODELS["fast"], api_key, language=detected_lang or None)
+                for seg in result_fast.get("segments", []) or []:
+                    segments_fast.append({
+                        "start": round(float(seg.get("start", 0)) + offset, 2),
+                        "end": round(float(seg.get("end", 0)) + offset, 2),
+                        "text": seg.get("text", ""),
+                    })
+        if mode == "accurate" and segments_fast:
+            segments = _fill_transcript_gaps(segments, segments_fast)
         # Merge Whisper's pause-splits back into whole sentences before
         # proofreading and translation, so a sentence is never cut in half
         # across two segments (e.g. "over a trillion" / "dollars").
