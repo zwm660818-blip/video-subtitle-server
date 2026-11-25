@@ -887,6 +887,83 @@ def transcribe_file(audio_path: Path, model: str, api_key: str, language: str = 
         raise PipelineError("transcribe", "转写服务返回了无法识别的内容")
 
 
+def transcribe_via_deepgram(audio_path: Path, api_key: str, language: str = None) -> dict:
+    """Fallback transcription via Deepgram Nova-3.
+
+    Used when Groq Whisper fails (rate limit / outage) and a
+    DEEPGRAM_API_KEY is configured. Deepgram returns utterances already
+    split into sentence-like chunks with punctuation (smart_format), so
+    the result needs no LLM proofread -- only the FIXED_PHRASES hard
+    rules and Simplified normalization downstream.
+
+    Returns a Whisper-shaped dict: {"segments": [{"start","end","text"}],
+    "language": "zh"} so callers can use it interchangeably with
+    transcribe_file's result. language is the Deepgram-detected code
+    ("zh", "en", ...) when present, else the requested language.
+    """
+    lang = language or "zh"
+    url = (
+        "https://api.deepgram.com/v1/listen"
+        f"?model=nova-3&language={lang}"
+        "&smart_format=true&punctuate=true&utterances=true"
+    )
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": "audio/mpeg",
+        "User-Agent": CHROME_UA,
+    }
+    try:
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        resp = httpx.post(
+            url, headers=headers, content=audio_bytes,
+            timeout=httpx.Timeout(600.0, connect=10.0),
+        )
+    except httpx.RequestError as exc:
+        raise PipelineError("transcribe", f"Deepgram 连不上: {exc}")
+    if resp.status_code == 401:
+        raise PipelineError("transcribe", "Deepgram API key 无效，请检查服务器上的 DEEPGRAM_API_KEY")
+    if resp.status_code != 200:
+        raise PipelineError("transcribe", f"转写失败，Deepgram 返回 HTTP {resp.status_code}")
+    try:
+        d = resp.json()
+    except json.JSONDecodeError:
+        raise PipelineError("transcribe", "Deepgram 返回了无法识别的内容")
+    segments: list[dict] = []
+    utterances = (d.get("results") or {}).get("utterances") or []
+    if utterances:
+        for u in utterances:
+            text = (u.get("transcript") or "").strip()
+            if not text:
+                continue
+            segments.append({
+                "start": float(u.get("start", 0)),
+                "end": float(u.get("end", 0)),
+                "text": text,
+            })
+    if not segments:
+        # No utterances (very short / silent audio): fall back to the
+        # single full transcript as one segment.
+        try:
+            alt = d["results"]["channels"][0]["alternatives"][0]
+            text = (alt.get("transcript") or "").strip()
+        except (KeyError, IndexError, TypeError):
+            text = ""
+        if text:
+            dur = 0.0
+            try:
+                dur = float((d.get("metadata") or {}).get("duration", 0) or 0)
+            except (TypeError, ValueError):
+                dur = 0.0
+            segments.append({"start": 0.0, "end": dur, "text": text})
+    detected = ""
+    try:
+        detected = (d["results"]["channels"][0].get("detected_language") or "").split("-")[0]
+    except (KeyError, IndexError, TypeError, AttributeError):
+        detected = ""
+    return {"segments": segments, "language": detected or lang}
+
+
 def _extract_anchors(segments: list[dict]) -> str:
     """Find model/version codes that recur across the whole transcript.
 
@@ -1430,6 +1507,7 @@ def _fill_transcript_gaps(primary: list[dict], secondary: list[dict], gap_thresh
 def do_transcribe(
     url: str, mode: str, api_key: str, on_stage=None, annotate: bool = False, punctuate: bool = True,
     local_file: str | None = None, local_title: str | None = None,
+    deepgram_key: str | None = None,
 ) -> dict:
     """Run the whole pipeline in a worker thread. Returns the response dict.
 
@@ -1440,6 +1518,12 @@ def do_transcribe(
     local_file: when set, the video/audio is already on disk (user upload),
     so parse/download are skipped and the job starts at the audio stage.
     local_title is the display title for an upload (its filename).
+
+    deepgram_key: when set, a Groq transcription failure (rate limit /
+    outage) falls back to Deepgram Nova-3 for that chunk instead of
+    failing the whole job. Deepgram output is already punctuated, so the
+    LLM proofread is skipped for Deepgram-transcribed jobs -- the
+    FIXED_PHRASES hard rules and Simplified normalization still run.
     """
     # Stage marks -> per-stage seconds, returned as "timings" and printed to
     # the log, so "where did the time go" is a fact, not a guess.
@@ -1499,6 +1583,27 @@ def do_transcribe(
         segments: list[dict] = []
         segments_fast: list[dict] = []
         detected_lang = ""
+        used_deepgram = False
+
+        def transcribe_chunk(chunk_path, model, language):
+            """One chunk via Groq; on Groq failure, Deepgram if configured.
+
+            Returns (result_dict, used_deepgram_bool). Deepgram returns the
+            same Whisper-shaped {"segments": [...], "language": ...} dict,
+            so callers treat both the same. A Deepgram failure raises
+            PipelineError like a Groq failure does.
+            """
+            nonlocal used_deepgram
+            try:
+                return transcribe_file(chunk_path, model, api_key, language=language), False
+            except PipelineError:
+                if not deepgram_key:
+                    raise
+                print("[transcribe] Groq 失败，切到 Deepgram 备胎", flush=True)
+                result = transcribe_via_deepgram(chunk_path, deepgram_key, language=language)
+                used_deepgram = True
+                return result, True
+
         for chunk_path, offset in chunks:
             # First chunk auto-detects the language; the rest reuse it so
             # a mixed-language video doesn't flip languages mid-way.
@@ -1517,18 +1622,22 @@ def do_transcribe(
                 # the two calls sequential; in parallel it is ~3s). The
                 # language is detected from the large-v3 result, as before;
                 # turbo gets the same language hint on later chunks.
+                #
+                # If Groq is down/rate-limited, transcribe_chunk falls
+                # back to Deepgram for that call; the gap-fill merge below
+                # still works because Deepgram returns the same shape.
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     fut_main = pool.submit(
-                        transcribe_file, chunk_path, model, api_key,
-                        language=detected_lang or None,
+                        transcribe_chunk, chunk_path, model,
+                        detected_lang or None,
                     )
                     fut_fast = pool.submit(
-                        transcribe_file, chunk_path, MODELS["fast"], api_key,
-                        language=detected_lang or None,
+                        transcribe_chunk, chunk_path, MODELS["fast"],
+                        detected_lang or None,
                     )
-                    result = fut_main.result()
-                    result_fast = fut_fast.result()
+                    result, _ = fut_main.result()
+                    result_fast, _ = fut_fast.result()
                 if not detected_lang:
                     detected_lang = _detect_lang_code(result)
                 for seg in result.get("segments", []) or []:
@@ -1544,7 +1653,7 @@ def do_transcribe(
                         "text": seg.get("text", ""),
                     })
             else:
-                result = transcribe_file(chunk_path, model, api_key, language=detected_lang or None)
+                result, _ = transcribe_chunk(chunk_path, model, detected_lang or None)
                 if not detected_lang:
                     detected_lang = _detect_lang_code(result)
                 for seg in result.get("segments", []) or []:
@@ -1572,24 +1681,34 @@ def do_transcribe(
         stage("proofread")
         proofread_stats = {"changed": 0, "batches": 0, "failed": 0}
         if is_chinese:
-            try:
-                segments, proofread_stats = proofread_segments(segments, title, api_key, punctuate)
-            except Exception as e:
-                # Never silently swallow this: a crash here looks exactly like
-                # "nothing to fix" (stats 0/0/0) and cost a whole deploy round
-                # in 2026-11-19 when a str+tuple TypeError killed proofreading.
-                print(f"[proofread] crashed, returning raw segments: {type(e).__name__}: {e}", flush=True)
-            # Optional: put （中文意思） after English words. Runs after proofreading
-            # so misheard English has already been restored. It reuses the
-            # "proofread" stage name on purpose: the page only knows the stages
-            # parse/download/audio/transcribe/proofread, and an unknown name would
-            # make its progress steps jump back to step 1.
-            if annotate:
+            if used_deepgram:
+                # Deepgram output is already punctuated and accurate, and
+                # the LLM proofreader runs on Groq -- the same service that
+                # just failed and forced the fallback. Skipping it keeps
+                # the fallback fully independent of Groq. The hard rules
+                # below still run (Deepgram makes the same 生根/深耕 slip
+                # Groq did), as does Simplified normalization.
+                proofread_stats["provider"] = "deepgram"
+                proofread_stats["skipped_llm"] = True
+            else:
                 try:
-                    segments, annotated = annotate_segments(segments, title, api_key)
-                    proofread_stats["annotated"] = annotated
-                except Exception:
-                    pass
+                    segments, proofread_stats = proofread_segments(segments, title, api_key, punctuate)
+                except Exception as e:
+                    # Never silently swallow this: a crash here looks exactly like
+                    # "nothing to fix" (stats 0/0/0) and cost a whole deploy round
+                    # in 2026-11-19 when a str+tuple TypeError killed proofreading.
+                    print(f"[proofread] crashed, returning raw segments: {type(e).__name__}: {e}", flush=True)
+                # Optional: put （中文意思） after English words. Runs after proofreading
+                # so misheard English has already been restored. It reuses the
+                # "proofread" stage name on purpose: the page only knows the stages
+                # parse/download/audio/transcribe/proofread, and an unknown name would
+                # make its progress steps jump back to step 1.
+                if annotate:
+                    try:
+                        segments, annotated = annotate_segments(segments, title, api_key)
+                        proofread_stats["annotated"] = annotated
+                    except Exception:
+                        pass
             # Fixed-phrase corrections run after the LLM proofreader (and
             # after annotating, so a gloss never lands on a wrong phrase):
             # the model has missed these in real jobs, code enforces them.
@@ -1610,6 +1729,7 @@ def do_transcribe(
             "segments": segments,
             "proofread": proofread_stats,
             "timings": stage_seconds,
+            "provider": "deepgram" if used_deepgram else "groq",
         }
 
 
@@ -1626,7 +1746,8 @@ jobs_lock = threading.Lock()
 JOB_TTL_SECONDS = 3600
 
 
-def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = False, punctuate: bool = True) -> None:
+def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = False, punctuate: bool = True,
+             deepgram_key: str | None = None) -> None:
     """Background worker: run the pipeline and store the outcome."""
     def on_stage(name: str):
         with jobs_lock:
@@ -1635,7 +1756,8 @@ def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = Fa
                 job["stage"] = name
 
     try:
-        result = do_transcribe(url, mode, api_key, on_stage=on_stage, annotate=annotate, punctuate=punctuate)
+        result = do_transcribe(url, mode, api_key, on_stage=on_stage, annotate=annotate, punctuate=punctuate,
+                               deepgram_key=deepgram_key)
         with jobs_lock:
             jobs[job_id] = {"status": "done", "stage": "done", **result}
     except PipelineError as exc:
@@ -1653,7 +1775,8 @@ def _run_job(job_id: str, url: str, mode: str, api_key: str, annotate: bool = Fa
 
 
 def _run_file_job(job_id: str, file_path: str, filename: str, mode: str, api_key: str,
-                  annotate: bool = False, punctuate: bool = True) -> None:
+                  annotate: bool = False, punctuate: bool = True,
+                  deepgram_key: str | None = None) -> None:
     """Background worker for an uploaded file. Same pipeline as a link,
     minus parse/download. Deletes the uploaded file when the job ends,
     success or failure, so uploads don't fill the container disk."""
@@ -1669,6 +1792,7 @@ def _run_file_job(job_id: str, file_path: str, filename: str, mode: str, api_key
             "", mode, api_key, on_stage=on_stage,
             annotate=annotate, punctuate=punctuate,
             local_file=file_path, local_title=title,
+            deepgram_key=deepgram_key,
         )
         with jobs_lock:
             jobs[job_id] = {"status": "done", "stage": "done", **result}
@@ -1752,6 +1876,10 @@ async def transcribe(request: Request):
                 "step": "config",
             },
         )
+    # Optional fallback: when Groq transcription fails (rate limit /
+    # outage), the pipeline falls back to Deepgram Nova-3 for that chunk.
+    # Empty means no fallback -- Groq failures fail the job as before.
+    deepgram_key = os.environ.get("DEEPGRAM_API_KEY", "").strip() or None
 
     _cleanup_jobs()
     job_id = uuid.uuid4().hex[:12]
@@ -1761,7 +1889,7 @@ async def transcribe(request: Request):
             "created_at": time.time(),
         }
     thread = threading.Thread(
-        target=_run_job, args=(job_id, url, mode, api_key, annotate, punctuate), daemon=True
+        target=_run_job, args=(job_id, url, mode, api_key, annotate, punctuate, deepgram_key), daemon=True
     )
     thread.start()
     return JSONResponse(
@@ -1797,6 +1925,8 @@ async def transcribe_file_upload(
                 "step": "config",
             },
         )
+    # Optional Deepgram fallback (see /transcribe).
+    deepgram_key = os.environ.get("DEEPGRAM_API_KEY", "").strip() or None
     if file is None or not file.filename:
         return JSONResponse(
             status_code=400,
@@ -1870,7 +2000,7 @@ async def transcribe_file_upload(
         }
     thread = threading.Thread(
         target=_run_file_job,
-        args=(job_id, str(dest), safe_name, mode, api_key, annotate_flag, punctuate_flag),
+        args=(job_id, str(dest), safe_name, mode, api_key, annotate_flag, punctuate_flag, deepgram_key),
         daemon=True,
     )
     thread.start()
