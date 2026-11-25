@@ -1077,6 +1077,16 @@ FIXED_PHRASES = {
     # "AI" heard as "AMI" ("担心 AMI一哪天"). Real "AMI" (Amazon Machine
     # Image) is rare in these videos; a stray "AMI" token is Whisper.
     "AMI": "AI",
+    # Reported 2026-11-25 on the Douyin video "年少有为真的不是什么好事":
+    # "负战" is Whisper mishearing 负债 (fu zhai) as 负战 (fu zhan).
+    # "负战" is not a real phrase, so it is safe to rewrite outright.
+    # The same mishearing also comes out as "复战" (the user's run) --
+    # that one IS a real word (rematch), so it is only handled by the
+    # scoped regex in FIXED_PATTERNS below, not here.
+    "负战": "负债",
+    # Same video: the famous quote 王侯将相宁有种乎 came out as
+    # "王洪江、向宁永走". The wrong form is not a real phrase.
+    "王洪江、向宁永走": "王侯将相宁有种乎",
 }
 # Regex rules for the same kind of trap, where the wrong form varies.
 # Reported 2026-11-19 on a "advice for young people" video, all three missed
@@ -1097,6 +1107,13 @@ FIXED_PATTERNS = [
     # means Claude ("这个Cloud", "这Cloud", "老A的Cloud"). Bare "Cloud" is
     # NOT rewritten: Google Cloud / iCloud are real names.
     (re.compile(r"(这个|这|老A的)Cloud"), r"\1Claude"),
+    # Reported 2026-11-25 on the Douyin video "年少有为真的不是什么好事":
+    # "复战" is the same 负债 mishearing as "负战" above (the user's run
+    # had "复战" where a re-run had "负战"). But "复战" is a real word
+    # (rematch, sports), so only rewrite it in debt constructions:
+    # 会/变成/变/是 + 复战, or 复战 + 累累 (负债累累 is the set phrase).
+    (re.compile(r"(会|变成|变|是)复战"), r"\1负债"),
+    (re.compile(r"复战(累累)"), r"负债\1"),
 ]
 
 
